@@ -41,3 +41,44 @@ This story is complete when:
 - All acceptance criteria are verified.
 - Quality checks pass (lint, typecheck, tests).
 - Code reviewed.
+
+---
+
+## Implementation Plan
+
+### Implementation Steps
+
+1. `src/org_harvest/errors.py` — add `ErrorKind.REQUEST_FAILED` for a request that exhausts retries with no usable response (the raise point AC-5.3's gap-recording will later catch).
+2. `src/org_harvest/ratelimit.py` — `RateLimitSnapshot`, `BudgetTracker` (AC-7.1, AC-7.3), `ConcurrencyLimiter` (AC-7.2), both with injectable `now`/`sleep` for waiting-free tests.
+3. `src/org_harvest/transport.py` — `Transport.send()`: shared retry/backoff-with-jitter (AC-7.6), auth header injection via Story 1's `CredentialProvider`, identifying headers (AC-7.10), and budget pacing before each attempt. Rate-limit extraction is injected by the caller (`extract_budget`) rather than hardcoded, since GraphQL/REST report their budgets in different shapes that don't exist until Stories 5/6.
+4. `src/org_harvest/__init__.py` — extend re-exports.
+
+### Files to Create/Modify
+
+| File | Action | Purpose |
+|---|---|---|
+| `src/org_harvest/errors.py` | Modify | Add `REQUEST_FAILED` |
+| `src/org_harvest/ratelimit.py` | Create | `RateLimitSnapshot`, `BudgetTracker`, `ConcurrencyLimiter` |
+| `src/org_harvest/transport.py` | Create | `Transport` |
+| `src/org_harvest/__init__.py` | Modify | Re-export new public types |
+| `tests/test_ratelimit.py` | Create | Budget wait and concurrency-limiter behavior |
+| `tests/test_transport.py` | Create | Full retry/pacing/header/concurrency coverage |
+
+### Cross-Module Seams
+
+One seam worth naming explicitly: `Transport.send()` calls `raise_on_unauthorized(self.credentials)` (Story 1) on a 401. Confirmed both sides in `tests/test_transport.py::TestRetryBehavior::test_401_raises_via_credential_provider_ac_3_4` — a static-token `Transport` receiving a mocked 401 raises `AUTH_EXPIRED`, proving Story 1's contract is actually wired into Story 2's request path, not just independently unit-tested.
+
+### Testing Approach
+
+- **Unit — `tests/test_ratelimit.py`:** `BudgetTracker` — no wait with no snapshot, no wait above the floor, waits the exact remaining time when exhausted with a controllable clock (AC-7.3), no wait when the reset time has already passed. `ConcurrencyLimiter` — bounds concurrent acquires (AC-7.2, lattice-style in-flight counter), reduces then auto-restores after its cooldown using a fully fake clock (no real sleep — AC-10.4), FIFO-ish fairness under contention.
+- **Unit — `tests/test_transport.py`:** headers include Authorization/User-Agent/Content-Type for GraphQL-style calls and Accept/API-version for REST-style calls (AC-7.10); `extract_budget` callback updates the tracker (AC-7.1); a pre-exhausted budget causes a wait of the exact remaining duration before the request goes out (AC-7.3, fake sleep/now, no real delay); 429 and a transient network error are each retried and succeed, with the exact backoff+jitter value asserted (AC-7.6); retries exhausted raises `REQUEST_FAILED`; a non-retryable 4xx is returned to the caller, not raised or retried; a secondary-limit signal (403 + `Retry-After`) reduces the concurrency limit and honors the retry-after duration (AC-7.2); concurrent `send()` calls across a shared `Transport` stay within the configured bound (lattice-style handler-based measurement).
+
+### Risks
+
+- **Secondary-limit detection heuristic** (`403`/`429` with a `Retry-After` header, or body text containing "rate limit") is not a documented, guaranteed GitHub response contract — it is the best available signal without a live API to verify against. If GitHub's actual wording differs, the effect is a missed cooldown, not incorrect behavior (the normal 429 retryable-status path still catches most secondary-limit cases).
+- **`ConcurrencyLimiter`'s cooldown restoration relies on a future `acquire()`/`release()` call to re-check the deadline** rather than a background timer — correct as long as in-flight requests always eventually release (guaranteed here, since `Transport.send()` releases in a `finally`), but worth remembering if this class is ever reused somewhere without that guarantee.
+
+### Decisions Made
+
+- **Rate-limit extraction is injected, not hardcoded** — Transport has no opinion on GraphQL vs. REST response shape; Story 5/6 supply real extractors. This keeps Story 2 fully testable against synthetic endpoints, independent of any dataset concept, and is the direct reason its test suite needed no GraphQL/REST fixtures at all.
+- **A custom `asyncio.Condition`-based `ConcurrencyLimiter`, not a plain `asyncio.Semaphore`** — a semaphore's permit count can't be shrunk safely at runtime with in-flight holders; the secondary-limit reduction (AC-7.2) needs exactly that.

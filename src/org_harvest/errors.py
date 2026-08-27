@@ -36,6 +36,10 @@ class ErrorKind(Enum):
     APP_NOT_INSTALLED = auto()
     """The organization exists but the App has no installation on it (EC-2)."""
 
+    REQUEST_FAILED = auto()
+    """A request yielded no usable response after exhausting retries
+    (network errors, timeouts, or persistent 429/5xx) (AC-5.3)."""
+
 
 class OrgHarvestError(Exception):
     """Raised for every org-harvest failure. See `ErrorKind` for categories."""
