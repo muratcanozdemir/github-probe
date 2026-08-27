@@ -40,6 +40,11 @@ class ErrorKind(Enum):
     """A request yielded no usable response after exhausting retries
     (network errors, timeouts, or persistent 429/5xx) (AC-5.3)."""
 
+    INVALID_USAGE = auto()
+    """A request the caller made is invalid independent of any network call
+    — an unknown dataset name (AC-2.4), an empty selection (AC-2.5), or a
+    programming error such as double-registering a dataset."""
+
     RATE_LIMIT_WAIT_EXCEEDED = auto()
     """Waiting for the rate limit to reset was refused because it would
     outlast a non-refreshable credential (AC-7.4), or because it would

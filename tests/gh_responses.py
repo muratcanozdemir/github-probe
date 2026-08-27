@@ -36,3 +36,24 @@ def token_response(token: str = "ghs_abc123", expires_in_seconds: int = 3600) ->
             "repository_selection": "all",
         },
     )
+
+
+def preflight_response(
+    repo_count: int = 10, limit: int = 5000, remaining: int = 4000
+) -> httpx.Response:
+    reset_at = (datetime.now(UTC) + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "rateLimit": {
+                    "limit": limit,
+                    "remaining": remaining,
+                    "resetAt": reset_at,
+                    "cost": 1,
+                    "nodeCount": 1,
+                },
+                "organization": {"repositories": {"totalCount": repo_count}},
+            }
+        },
+    )

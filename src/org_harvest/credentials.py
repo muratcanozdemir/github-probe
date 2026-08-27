@@ -53,6 +53,17 @@ class CredentialProvider(Protocol):
     #: for a static token, which carries no installation metadata.
     installation_id: int | None
 
+    #: The permissions actually granted to the current token, keyed by
+    #: GitHub's App permission names (e.g. "contents", "members"), or `None`
+    #: when unknown. A pre-minted token's permissions are never introspectable
+    #: locally — GitHub has no "what can this token do" endpoint — so this is
+    #: always `None` for `StaticTokenCredentialProvider` (AC-6.1).
+    permissions: dict[str, str] | None
+
+    #: "all" or "selected", or `None` when unknown (same caveat as
+    #: `permissions`) (AC-6.1, EC-3).
+    repository_selection: str | None
+
     async def get_token(self) -> str:
         """Return a currently-valid installation token, minting or
         refreshing it first if needed."""
@@ -88,6 +99,8 @@ class StaticTokenCredentialProvider:
         self._token = token
         self._expires_at = expires_at
         self.installation_id: int | None = None
+        self.permissions: dict[str, str] | None = None
+        self.repository_selection: str | None = None
 
     async def get_token(self) -> str:
         return self._token
