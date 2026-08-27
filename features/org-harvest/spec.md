@@ -1,7 +1,7 @@
 # Feature Specification: org-harvest
 
 **Status:** APPROVED
-**Challenged:** No
+**Challenged:** Yes
 **UI Required:** No
 **Created:** 2026-08-27
 **Feature:** A Python CLI and library that downloads a complete, self-consistent snapshot of a GitHub organization via the GraphQL API, authenticating as a GitHub App installation.
