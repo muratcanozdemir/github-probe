@@ -2,11 +2,11 @@
 
 **Feature:** [features/org-harvest/](../)
 **Started:** 2026-08-27
-**Last Updated:** 2026-08-27 00:00
+**Last Updated:** 2026-08-28 00:30
 
 | # | Story | Status | Started | Completed |
 |---|-------|--------|---------|-----------|
-| 1 | App installation auth | not-started | - | - |
+| 1 | App installation auth | implemented | 2026-08-28 | 2026-08-28 |
 | 2 | Rate-limit pacing | not-started | - | - |
 | 3 | Budget sharing | not-started | - | - |
 | 4 | Preflight readiness | not-started | - | - |
