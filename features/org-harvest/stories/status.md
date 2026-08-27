@@ -13,7 +13,7 @@
 | 5 | Organization directory | implemented | 2026-08-28 | 2026-08-28 |
 | 6 | Repository datasets | implemented | 2026-08-28 | 2026-08-28 |
 | 7 | Failure resilience | implemented | 2026-08-28 | 2026-08-28 |
-| 8 | Parquet finalization | not-started | - | - |
+| 8 | Parquet finalization | implemented | 2026-08-28 | 2026-08-28 |
 | 9 | Snapshot manifest | not-started | - | - |
 | 10 | Full snapshot run | not-started | - | - |
 | 11 | Dataset selection | not-started | - | - |
