@@ -10,7 +10,7 @@
 | 2 | Rate-limit pacing | implemented | 2026-08-28 | 2026-08-28 |
 | 3 | Budget sharing | implemented | 2026-08-28 | 2026-08-28 |
 | 4 | Preflight readiness | implemented | 2026-08-28 | 2026-08-28 |
-| 5 | Organization directory | not-started | - | - |
+| 5 | Organization directory | implemented | 2026-08-28 | 2026-08-28 |
 | 6 | Repository datasets | not-started | - | - |
 | 7 | Failure resilience | not-started | - | - |
 | 8 | Parquet finalization | not-started | - | - |

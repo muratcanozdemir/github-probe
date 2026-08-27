@@ -13,15 +13,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum
-
-import httpx
 
 from org_harvest.credentials import CredentialProvider
 from org_harvest.datasets import DatasetLevel, DatasetSpec, get
+from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.hosts import ApiHost
-from org_harvest.ratelimit import RateLimitSnapshot
 from org_harvest.transport import Transport
 
 _PREFLIGHT_QUERY = """
@@ -66,18 +63,6 @@ class PreflightReport:
     @property
     def any_blocked(self) -> bool:
         return any(v.verdict is Verdict.BLOCKED for v in self.dataset_verdicts)
-
-
-def _extract_graphql_budget(resp: httpx.Response) -> RateLimitSnapshot | None:
-    try:
-        data = resp.json()["data"]["rateLimit"]
-    except (KeyError, TypeError, ValueError):
-        return None
-    return RateLimitSnapshot(
-        limit=data["limit"],
-        remaining=data["remaining"],
-        reset_at=datetime.fromisoformat(data["resetAt"].replace("Z", "+00:00")).timestamp(),
-    )
 
 
 def _check_dataset_permissions(
@@ -130,7 +115,7 @@ async def run_preflight(
     resp = await transport.send_graphql(
         host.graphql_url,
         payload={"query": _PREFLIGHT_QUERY, "variables": {"org": org}},
-        extract_budget=_extract_graphql_budget,
+        extract_budget=extract_rate_limit_snapshot,
     )
     resp.raise_for_status()
     body = resp.json()["data"]
