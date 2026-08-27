@@ -51,6 +51,12 @@ class ErrorKind(Enum):
     exceed the configured total-wait ceiling (AC-7.5). The run stops
     cleanly with whatever has already been checkpointed to disk."""
 
+    SYSTEMIC_FAILURE = auto()
+    """A consecutive-failure count or failure rate crossed its configured
+    threshold (FR-5, EC-8) — treated as an outage, not an accumulation of
+    per-resource gaps. The run stops cleanly with resumable state and does
+    not finalize."""
+
 
 class OrgHarvestError(Exception):
     """Raised for every org-harvest failure. See `ErrorKind` for categories."""

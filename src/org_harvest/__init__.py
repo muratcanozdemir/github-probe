@@ -20,6 +20,7 @@ from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.harvest.org_level import OrgLevelResult, fetch_organization_directory
 from org_harvest.harvest.repo_level import RepoLevelResult, fetch_repository_datasets
+from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.preflight import DatasetVerdict, PreflightReport, Verdict, run_preflight
 from org_harvest.ratelimit import BudgetTracker, ConcurrencyLimiter, RateLimitSnapshot
@@ -45,6 +46,7 @@ __all__ = [
     "PreflightReport",
     "RateLimitSnapshot",
     "RepoLevelResult",
+    "SystemicFailureGuard",
     "StaticTokenCredentialProvider",
     "Transport",
     "Verdict",

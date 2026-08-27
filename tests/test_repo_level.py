@@ -6,10 +6,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import StaticTokenCredentialProvider
+from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.harvest.repo_level import (
     _REPO_CONNECTIONS,
     REPO_LEVEL_DATASET_NAMES,
@@ -17,6 +19,7 @@ from org_harvest.harvest.repo_level import (
     _RepoState,
     fetch_repository_datasets,
 )
+from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.transport import Transport
 
@@ -363,6 +366,7 @@ class TestNodeLimitRetry:
             checkpoint=checkpoint,
             page_size=50,
             batch_width=10,
+            systemic_guard=SystemicFailureGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
@@ -408,6 +412,7 @@ class TestNodeLimitRetry:
             checkpoint=checkpoint,
             page_size=4,
             batch_width=2,
+            systemic_guard=SystemicFailureGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         batch = [_RepoState(id="R_1", name="repo1"), _RepoState(id="R_2", name="repo2")]
@@ -446,6 +451,7 @@ class TestNodeLimitRetry:
             checkpoint=checkpoint,
             page_size=1,
             batch_width=1,
+            systemic_guard=SystemicFailureGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
@@ -455,4 +461,68 @@ class TestNodeLimitRetry:
         assert result.written == 0
         assert len(result.gaps) == 1
         assert "node limit" in result.gaps[0].reason
+        await transport.aclose()
+
+
+class TestSystemicFailure:
+    async def test_a_run_of_no_response_failures_stops_the_run_ec_8(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [(f"R_{i}", f"repo{i}") for i in range(20)])
+
+        async def no_sleep(seconds: float) -> None:
+            return None
+
+        def always_503(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider, sleep=no_sleep, max_retries=0, backoff_base_seconds=0)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=always_503)
+            with pytest.raises(OrgHarvestError) as exc_info:
+                await fetch_repository_datasets(
+                    transport,
+                    org="acme",
+                    snapshot_dir=snapshot_dir,
+                    batch_width=1,
+                    systemic_guard=SystemicFailureGuard(max_consecutive_failures=3),
+                )
+        assert exc_info.value.kind is ErrorKind.SYSTEMIC_FAILURE
+        await transport.aclose()
+
+    async def test_a_batch_transport_failure_counts_as_one_attempt_not_one_per_repo(
+        self, tmp_path: Path
+    ):
+        """A single invalidated batch of many repositories is one failed
+        request, not `batch_width` failed requests — the guard tracks
+        requests, not the resources inside them."""
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [(f"R_{i}", f"repo{i}") for i in range(5)])
+
+        async def no_sleep(seconds: float) -> None:
+            return None
+
+        def always_503(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider, sleep=no_sleep, max_retries=0, backoff_base_seconds=0)
+        # batch_width=5 means all 5 repos fail in ONE request per dataset —
+        # if the guard counted per-repository, 5 datasets would already be
+        # 25 failures and blow past this threshold several times over.
+        guard = SystemicFailureGuard(max_consecutive_failures=5)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=always_503)
+            with pytest.raises(OrgHarvestError) as exc_info:
+                await fetch_repository_datasets(
+                    transport,
+                    org="acme",
+                    snapshot_dir=snapshot_dir,
+                    batch_width=5,
+                    systemic_guard=guard,
+                )
+        assert exc_info.value.kind is ErrorKind.SYSTEMIC_FAILURE
+        # Tripped after exactly 5 failed requests (one per dataset attempted
+        # so far), not 25 — proving the guard counts requests, not repos.
+        assert guard.total_attempts == 5
         await transport.aclose()

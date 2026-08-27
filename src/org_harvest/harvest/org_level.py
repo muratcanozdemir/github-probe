@@ -40,6 +40,7 @@ from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
+from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.output import NdjsonWriter
 from org_harvest.transport import Transport
@@ -260,6 +261,7 @@ class _OrgLevelHarvester:
         api_host: ApiHost,
         checkpoint: CheckpointStore,
         page_size: int,
+        systemic_guard: SystemicFailureGuard,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -267,6 +269,7 @@ class _OrgLevelHarvester:
         self._url = api_host.graphql_url
         self._checkpoint = checkpoint
         self._page_size = page_size
+        self._systemic_guard = systemic_guard
 
     def _writer(self, dataset: str) -> NdjsonWriter:
         return NdjsonWriter(self._snapshot_dir / f"{dataset}.ndjson")
@@ -290,10 +293,12 @@ class _OrgLevelHarvester:
             )
         except OrgHarvestError as exc:
             if exc.kind is ErrorKind.REQUEST_FAILED:
+                self._systemic_guard.record_attempt(failed=True)
                 return None, [], str(exc)
             raise
         resp.raise_for_status()
         body = resp.json()
+        self._systemic_guard.record_attempt(failed=False)
         return body.get("data"), body.get("errors", []), None
 
     def _record_errors(
@@ -488,12 +493,18 @@ async def fetch_organization_directory(
     api_host: ApiHost | None = None,
     page_size: int = _DEFAULT_PAGE_SIZE,
     checkpoint: CheckpointStore | None = None,
+    systemic_guard: SystemicFailureGuard | None = None,
 ) -> OrgLevelResult:
     """Fetches every organization-level default-tier dataset (AC-1.2) and
     writes each to `snapshot_dir` as NDJSON. Always fetches the full
     org-level default tier unconditionally — dataset narrowing (Story 11)
     and resume (Story 12) are layered on top of this by later stories, not
-    implemented here."""
+    implemented here.
+
+    Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
+    `systemic_guard` — shared with Phase 2 by the caller if desired, or left
+    to default to a fresh one scoped just to this phase — trips its
+    consecutive-failure or failure-rate threshold partway through."""
     register_fetch_details()
     host = api_host or ApiHost()
     if checkpoint is None:
@@ -509,6 +520,7 @@ async def fetch_organization_directory(
         api_host=host,
         checkpoint=checkpoint,
         page_size=page_size,
+        systemic_guard=systemic_guard or SystemicFailureGuard(),
     )
 
     outcomes: list[DatasetOutcome] = [await harvester.fetch_organization_scalar()]

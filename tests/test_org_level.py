@@ -15,6 +15,7 @@ from org_harvest.harvest.org_level import (
     ORG_LEVEL_DATASET_NAMES,
     fetch_organization_directory,
 )
+from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.transport import Transport
 
 GITHUB = "https://api.github.com"
@@ -450,6 +451,7 @@ class TestPagination:
                 api_host=__import__("org_harvest").ApiHost(),
                 checkpoint=checkpoint,
                 page_size=1,
+                systemic_guard=SystemicFailureGuard(),
             )
             spec = next(s for s in _ORG_CONNECTIONS if s.dataset == "members")
             outcome = await harvester.fetch_org_connection(spec)
@@ -550,4 +552,97 @@ class TestPartialFailure:
                     transport, provider, org="acme", snapshot_dir=snapshot_dir
                 )
         assert exc_info.value.kind is ErrorKind.AUTH_EXPIRED
+        await transport.aclose()
+
+
+class TestSystemicFailure:
+    async def test_a_run_of_no_response_failures_stops_the_run_ec_8(self, tmp_path: Path):
+        """Every dataset request fails with no usable response — a
+        simulated outage. The default guard should trip well before all
+        eleven org-level datasets are attempted, and the failure must be a
+        SYSTEMIC_FAILURE, not accumulated gaps for every dataset."""
+
+        async def no_sleep(seconds: float) -> None:
+            return None
+
+        def always_503(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider, sleep=no_sleep, max_retries=0, backoff_base_seconds=0)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=always_503)
+            with pytest.raises(OrgHarvestError) as exc_info:
+                await fetch_organization_directory(
+                    transport,
+                    provider,
+                    org="acme",
+                    snapshot_dir=snapshot_dir,
+                    systemic_guard=SystemicFailureGuard(max_consecutive_failures=3),
+                )
+        assert exc_info.value.kind is ErrorKind.SYSTEMIC_FAILURE
+        await transport.aclose()
+
+    async def test_a_shared_guard_can_span_multiple_calls(self, tmp_path: Path):
+        """Demonstrates the seam Story 10 will use: one guard instance
+        passed to both phases accumulates failures across both."""
+
+        def always_503(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503)
+
+        async def no_sleep(seconds: float) -> None:
+            return None
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider, sleep=no_sleep, max_retries=0, backoff_base_seconds=0)
+        snapshot_dir = tmp_path / "snapshot"
+        guard = SystemicFailureGuard(max_consecutive_failures=2)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=always_503)
+            with pytest.raises(OrgHarvestError) as exc_info:
+                await fetch_organization_directory(
+                    transport,
+                    provider,
+                    org="acme",
+                    snapshot_dir=snapshot_dir,
+                    systemic_guard=guard,
+                )
+        assert exc_info.value.kind is ErrorKind.SYSTEMIC_FAILURE
+        assert guard.consecutive_failures >= 2
+        await transport.aclose()
+
+    async def test_graphql_partial_errors_do_not_count_toward_the_systemic_guard(
+        self, tmp_path: Path
+    ):
+        """A response that arrives with GraphQL-level errors (data present
+        or null, errors populated) is the Story 5/6 gap case, not the
+        no-response case this guard tracks — it must not push the
+        consecutive-failure counter."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = json.loads(request.content)["query"]
+            if "rulesets(" in query:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {"rateLimit": _rate_limit(), "organization": None},
+                        "errors": [{"path": ["organization", "rulesets"], "message": "nope"}],
+                    },
+                )
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        guard = SystemicFailureGuard(max_consecutive_failures=1)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_organization_directory(
+                transport, provider, org="acme", snapshot_dir=snapshot_dir, systemic_guard=guard
+            )
+        # Did not raise, even though max_consecutive_failures=1 — a GraphQL
+        # partial error was never reported as a "no response" attempt.
+        assert result.has_gaps
+        assert guard.consecutive_failures == 0
         await transport.aclose()

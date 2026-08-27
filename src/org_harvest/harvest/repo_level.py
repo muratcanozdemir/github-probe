@@ -46,6 +46,7 @@ from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
+from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.output import NdjsonWriter
 from org_harvest.transport import Transport
@@ -328,6 +329,7 @@ class _RepoLevelHarvester:
         checkpoint: CheckpointStore,
         page_size: int,
         batch_width: int,
+        systemic_guard: SystemicFailureGuard,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -337,6 +339,7 @@ class _RepoLevelHarvester:
         self._page_size = page_size
         self._batch_width = batch_width
         self._writers: dict[str, NdjsonWriter] = {}
+        self._systemic_guard = systemic_guard
 
     async def _query(
         self, query: str, variables: dict[str, Any]
@@ -349,10 +352,12 @@ class _RepoLevelHarvester:
             )
         except OrgHarvestError as exc:
             if exc.kind is ErrorKind.REQUEST_FAILED:
+                self._systemic_guard.record_attempt(failed=True)
                 return None, [], str(exc)
             raise
         resp.raise_for_status()
         body = resp.json()
+        self._systemic_guard.record_attempt(failed=False)
         return body.get("data"), body.get("errors", []), None
 
     def _build_query(
@@ -527,12 +532,18 @@ async def fetch_repository_datasets(
     page_size: int = _DEFAULT_PAGE_SIZE,
     batch_width: int = _DEFAULT_BATCH_WIDTH,
     checkpoint: CheckpointStore | None = None,
+    systemic_guard: SystemicFailureGuard | None = None,
 ) -> RepoLevelResult:
     """Fetches every repository-level default-tier dataset (AC-1.2) for
     every repository Story 5 wrote to `repositories.ndjson`, and writes
     each dataset to `snapshot_dir` as NDJSON. Requires Phase 1 to have
     already run in this `snapshot_dir` (architecture.md, Decision 4) — an
-    empty repository list is a valid, empty result, not an error (EC-1)."""
+    empty repository list is a valid, empty result, not an error (EC-1).
+
+    Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
+    `systemic_guard` — shared with Phase 1 by the caller if desired, or left
+    to default to a fresh one scoped just to this phase — trips its
+    consecutive-failure or failure-rate threshold partway through."""
     register_fetch_details()
     host = api_host or ApiHost()
     if checkpoint is None:
@@ -550,6 +561,7 @@ async def fetch_repository_datasets(
         checkpoint=checkpoint,
         page_size=page_size,
         batch_width=batch_width,
+        systemic_guard=systemic_guard or SystemicFailureGuard(),
     )
     outcomes = []
     try:
