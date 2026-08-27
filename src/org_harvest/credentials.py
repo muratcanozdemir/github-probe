@@ -73,12 +73,20 @@ class CredentialProvider(Protocol):
 
 
 class StaticTokenCredentialProvider:
-    """Wraps a pre-minted installation token. Never refreshes (AC-3.2)."""
+    """Wraps a pre-minted installation token. Never refreshes (AC-3.2).
 
-    def __init__(self, token: str) -> None:
+    `expires_at` is optional: GitHub's token-minting response includes it,
+    so a caller who minted the token themselves (or otherwise knows it) can
+    pass it along so the transport layer's rate-limit-wait safety check
+    (AC-7.4) can actually protect them. Without it, expiry is simply unknown
+    until GitHub rejects the token (AC-3.4) — this class does not guess.
+    """
+
+    def __init__(self, token: str, *, expires_at: float | None = None) -> None:
         if not token or not token.strip():
             raise OrgHarvestError("Pre-minted token is empty.", kind=ErrorKind.CREDENTIAL_INVALID)
         self._token = token
+        self._expires_at = expires_at
         self.installation_id: int | None = None
 
     async def get_token(self) -> str:
@@ -88,7 +96,9 @@ class StaticTokenCredentialProvider:
         return False
 
     def seconds_until_expiry(self) -> float | None:
-        return None  # Unknown until GitHub rejects it (AC-3.4).
+        if self._expires_at is None:
+            return None  # Unknown until GitHub rejects it (AC-3.4).
+        return self._expires_at - time.time()
 
     async def aclose(self) -> None:
         return None

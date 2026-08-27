@@ -61,15 +61,27 @@ class Transport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         backoff_base_seconds: float = _DEFAULT_BACKOFF_BASE_SECONDS,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        reserve_floor: int = 1,
+        max_total_wait_seconds: float | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], float] = time.time,
         jitter: Callable[[], float] = lambda: random.uniform(0, 0.25),
     ) -> None:
         self.credentials = credentials
+        #: Separate, independently-reportable budgets (AC-7.9) — a GraphQL
+        #: point-budget exhaustion never blocks a REST call and vice versa.
+        self.graphql_budget = BudgetTracker("graphql")
+        self.rest_budget = BudgetTracker("rest")
         self._http = httpx.AsyncClient(timeout=timeout_seconds)
         self._limiter = ConcurrencyLimiter(max_concurrency)
         self._max_retries = max_retries
         self._backoff_base = backoff_base_seconds
+        #: Reserve this many points/requests for other consumers of the same
+        #: installation (AC-7.7) — the budget is treated as exhausted once
+        #: remaining drops to or below this floor, not only at zero.
+        self._reserve_floor = reserve_floor
+        self._max_total_wait_seconds = max_total_wait_seconds
+        self._total_wait_seconds = 0.0
         self._sleep = sleep
         self._now = now
         self._jitter = jitter
@@ -82,6 +94,44 @@ class Transport:
         """The effective concurrency bound right now — lower than configured
         while a secondary-limit cooldown is active (AC-7.2)."""
         return self._limiter.current_max
+
+    @property
+    def total_wait_seconds(self) -> float:
+        """Cumulative time spent waiting out rate limits over this
+        Transport's lifetime — reported in the run summary (AC-1.3)."""
+        return self._total_wait_seconds
+
+    async def send_graphql(
+        self,
+        url: str,
+        *,
+        payload: dict[str, Any],
+        extract_budget: ExtractBudget | None = None,
+    ) -> httpx.Response:
+        """Convenience wrapper pacing against the GraphQL point budget
+        (AC-7.9)."""
+        return await self.send(
+            "POST", url, budget=self.graphql_budget, extract_budget=extract_budget, json=payload
+        )
+
+    async def send_rest(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, Any] | None = None,
+        extract_budget: ExtractBudget | None = None,
+    ) -> httpx.Response:
+        """Convenience wrapper pacing against the separate REST request
+        budget (AC-7.9)."""
+        return await self.send(
+            method,
+            url,
+            budget=self.rest_budget,
+            extract_budget=extract_budget,
+            json=json,
+            rest_style_headers=True,
+        )
 
     async def send(
         self,
@@ -102,7 +152,12 @@ class Transport:
         retry_after_seconds = 0.0
 
         for attempt in range(self._max_retries + 1):
-            await budget.wait_if_exhausted(sleep=self._sleep, now=self._now)
+            await budget.wait_if_exhausted(
+                min_remaining=self._reserve_floor,
+                sleep=self._sleep,
+                now=self._now,
+                before_wait=self._check_wait_is_safe,
+            )
             headers = await self._build_headers(extra_headers, rest_style_headers)
 
             await self._limiter.acquire(now=self._now)
@@ -148,6 +203,36 @@ class Transport:
             f"request to {url} failed after {self._max_retries + 1} attempts: {last_exc}",
             kind=ErrorKind.REQUEST_FAILED,
         ) from last_exc
+
+    async def _check_wait_is_safe(self, wait_for: float) -> None:
+        """Called just before actually sleeping for a rate-limit reset.
+        Refuses the wait — raising so the caller can stop the run cleanly
+        and resumably — rather than sleeping into a certain, wasted failure.
+        """
+        remaining_credential = self.credentials.seconds_until_expiry()
+        if (
+            not self.credentials.can_refresh()
+            and remaining_credential is not None
+            and wait_for > remaining_credential
+        ):
+            raise OrgHarvestError(
+                f"Waiting {wait_for:.0f}s for the rate limit to reset would "
+                "outlast the current installation token, which cannot be "
+                "refreshed automatically. Stopping so the run can be "
+                "resumed once a valid token is available.",
+                kind=ErrorKind.RATE_LIMIT_WAIT_EXCEEDED,
+            )
+        if (
+            self._max_total_wait_seconds is not None
+            and self._total_wait_seconds + wait_for > self._max_total_wait_seconds
+        ):
+            raise OrgHarvestError(
+                f"Waiting {wait_for:.0f}s more would exceed the configured "
+                f"total wait ceiling of {self._max_total_wait_seconds:.0f}s "
+                "for this run. Stopping so the run can be resumed later.",
+                kind=ErrorKind.RATE_LIMIT_WAIT_EXCEEDED,
+            )
+        self._total_wait_seconds += wait_for
 
     async def _build_headers(
         self, extra_headers: dict[str, str] | None, rest_style_headers: bool

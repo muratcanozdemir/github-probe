@@ -277,3 +277,18 @@ async def test_api_host_is_configurable_ac_3_9(rsa_private_key_path: Path):
         token = await provider.get_token()
     assert token == "ghs_abc123"
     await provider.aclose()
+
+
+class TestStaticTokenKnownExpiry:
+    async def test_reports_expiry_when_given(self):
+        from datetime import UTC, datetime, timedelta
+
+        expires_at = (datetime.now(UTC) + timedelta(seconds=120)).timestamp()
+        provider = StaticTokenCredentialProvider("ghs_x", expires_at=expires_at)
+        remaining = provider.seconds_until_expiry()
+        assert remaining is not None
+        assert 100 < remaining <= 120
+
+    async def test_unknown_expiry_by_default(self):
+        provider = StaticTokenCredentialProvider("ghs_x")
+        assert provider.seconds_until_expiry() is None

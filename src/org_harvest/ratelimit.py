@@ -53,16 +53,28 @@ class BudgetTracker:
         min_remaining: int = 1,
         sleep: Sleep = asyncio.sleep,
         now: Now = time.time,
+        before_wait: Callable[[float], Awaitable[None]] | None = None,
     ) -> float | None:
         """If the tracked budget is at or under `min_remaining`, sleep until
         the advertised reset (AC-7.3). Returns seconds waited, or `None` if
-        no wait was needed."""
+        no wait was needed.
+
+        `min_remaining` doubles as the reserved-budget floor (AC-7.7) — a
+        caller that never wants to dip below, say, 50 points passes
+        `min_remaining=50` rather than the default of 1.
+
+        `before_wait`, if given, is awaited with the computed wait duration
+        immediately before actually sleeping, and may raise to refuse the
+        wait (AC-7.4, AC-7.5) — the budget is left untouched if it does.
+        """
         snap = self._snapshot
         if snap is None or snap.remaining > min_remaining:
             return None
         wait_for = snap.reset_at - now()
         if wait_for <= 0:
             return None
+        if before_wait is not None:
+            await before_wait(wait_for)
         await sleep(wait_for)
         # Optimistic reset; the next real response corrects this.
         self._snapshot = RateLimitSnapshot(

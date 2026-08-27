@@ -40,6 +40,12 @@ class ErrorKind(Enum):
     """A request yielded no usable response after exhausting retries
     (network errors, timeouts, or persistent 429/5xx) (AC-5.3)."""
 
+    RATE_LIMIT_WAIT_EXCEEDED = auto()
+    """Waiting for the rate limit to reset was refused because it would
+    outlast a non-refreshable credential (AC-7.4), or because it would
+    exceed the configured total-wait ceiling (AC-7.5). The run stops
+    cleanly with whatever has already been checkpointed to disk."""
+
 
 class OrgHarvestError(Exception):
     """Raised for every org-harvest failure. See `ErrorKind` for categories."""
