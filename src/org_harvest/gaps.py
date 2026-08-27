@@ -36,3 +36,14 @@ class Gap:
             reason=reason,
             occurred_at=utc_now_iso(),
         )
+
+
+@dataclass(frozen=True)
+class DatasetOutcome:
+    """How one dataset's fetch went, whether that fetch was org-level
+    (Story 5) or repository-level (Story 6) — the same shape either way, so
+    callers that aggregate across both phases don't need to distinguish."""
+
+    name: str
+    record_count: int
+    gaps: tuple[Gap, ...]

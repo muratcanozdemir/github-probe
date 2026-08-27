@@ -24,3 +24,17 @@ Track any changes from the per-story implementation plan. Each deviation is logg
 **Actual:** Moved that function, unchanged in behavior, to a new `src/org_harvest/graphql.py` as public `extract_rate_limit_snapshot`, and updated `preflight.py` to import and use it instead of its own copy.
 **Reasoning:** A second hand-rolled copy of the same JSON-shape extraction is exactly the kind of drift the declarative-registry decision (architecture.md, Decision 1) exists to avoid elsewhere — the same principle applies here even though this isn't dataset-registry code. One shared, tested helper is safer than two copies that could silently diverge (e.g. if GitHub's rate-limit shape ever changes).
 **Impact:** None on Story 4's existing tests or behavior — `preflight.py`'s public API and every test in `tests/test_preflight.py` are unaffected; only the internal extraction helper moved. A new `tests/test_graphql.py` covers the extractor directly.
+
+### DEV-4: Extracted `_snake_case`/`_flatten_node` out of Story 5's `org_level.py` into a shared `harvest/flatten.py`
+**Story:** Story 6
+**Planned:** Story 6's repository-level fetch engine needs the exact same GraphQL-node-to-record flattening logic (camelCase-to-snake_case key rename, identity synthesis for node types with no `id`) that Story 5 wrote as private helpers in `org_level.py`.
+**Actual:** Moved `_snake_case`/`_flatten_node`, unchanged in behavior, to `src/org_harvest/harvest/flatten.py` as public `snake_case`/`flatten_node`, and updated `org_level.py` to import and use them.
+**Reasoning:** Same rationale as DEV-3 — a second hand-copy of identical flattening logic in `repo_level.py` would be exactly the kind of drift the declarative-registry decision exists to prevent elsewhere in this codebase. One shared, already-tested (via Story 5's existing tests, which continue to pass unchanged) implementation is safer than two copies.
+**Impact:** None on Story 5's behavior or tests — `org_level.py`'s public API is unchanged; only the internal helper functions moved and were renamed from private (`_snake_case`, `_flatten_node`) to public (`snake_case`, `flatten_node`) since they now have two callers across module boundaries.
+
+### DEV-5: Consolidated `DatasetOutcome` into `gaps.py` as a single shared type
+**Story:** Story 6
+**Planned:** Story 6's `RepoLevelResult` needs a per-dataset outcome shape (name, record count, gaps) — the exact same shape Story 5's `OrgLevelResult` already defined as `org_level.DatasetOutcome`.
+**Actual:** Rather than `repo_level.py` defining its own structurally-identical `DatasetOutcome`, the type was moved (unchanged) into `gaps.py` — the module already owning the closely related `Gap` type — and both `org_level.py` and `repo_level.py` now import it from there. The package root re-export (`org_harvest.DatasetOutcome`) now points at `gaps.DatasetOutcome` instead of `org_level.DatasetOutcome`; the public name and shape are unaffected.
+**Reasoning:** Two independently-defined dataclasses with identical fields are a drift risk the moment one of them changes — a caller that aggregates outcomes from both phases (Story 10's `run` command will do exactly this) should not have to know or care which phase produced which outcome.
+**Impact:** None on Story 5's tests (they never imported `DatasetOutcome` by name) or public API (the re-exported name and shape at `org_harvest.DatasetOutcome` are identical).

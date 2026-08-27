@@ -17,12 +17,9 @@ from org_harvest.datasets import all_specs as all_dataset_specs
 from org_harvest.datasets import default_tier_names as default_dataset_names
 from org_harvest.datasets import get as get_dataset_spec
 from org_harvest.errors import ErrorKind, OrgHarvestError
-from org_harvest.gaps import Gap
-from org_harvest.harvest.org_level import (
-    DatasetOutcome,
-    OrgLevelResult,
-    fetch_organization_directory,
-)
+from org_harvest.gaps import DatasetOutcome, Gap
+from org_harvest.harvest.org_level import OrgLevelResult, fetch_organization_directory
+from org_harvest.harvest.repo_level import RepoLevelResult, fetch_repository_datasets
 from org_harvest.hosts import ApiHost
 from org_harvest.preflight import DatasetVerdict, PreflightReport, Verdict, run_preflight
 from org_harvest.ratelimit import BudgetTracker, ConcurrencyLimiter, RateLimitSnapshot
@@ -47,6 +44,7 @@ __all__ = [
     "OrgLevelResult",
     "PreflightReport",
     "RateLimitSnapshot",
+    "RepoLevelResult",
     "StaticTokenCredentialProvider",
     "Transport",
     "Verdict",
@@ -54,6 +52,7 @@ __all__ = [
     "build_credential_provider",
     "default_dataset_names",
     "fetch_organization_directory",
+    "fetch_repository_datasets",
     "get_dataset_spec",
     "run_preflight",
 ]

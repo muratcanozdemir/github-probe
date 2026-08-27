@@ -37,8 +37,9 @@ from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import CredentialProvider
 from org_harvest.datasets import complete_fetch_details
 from org_harvest.errors import ErrorKind, OrgHarvestError
-from org_harvest.gaps import Gap
+from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.graphql import extract_rate_limit_snapshot
+from org_harvest.harvest.flatten import flatten_node
 from org_harvest.hosts import ApiHost
 from org_harvest.output import NdjsonWriter
 from org_harvest.transport import Transport
@@ -75,7 +76,7 @@ class _ConnectionSpec:
     #: GraphQL node field carrying this record's identity. Falls back to
     #: `"id"` for every type that has a node id; the one dataset whose type
     #: doesn't (`org_custom_properties`) names its natural key instead, and
-    #: `_flatten_node` synthesizes `id` from it (AC-8.6).
+    #: `flatten_node` synthesizes `id` from it (AC-8.6).
     id_field: str = "id"
     record_fields: tuple[str, ...] = ()
 
@@ -223,40 +224,11 @@ def register_fetch_details() -> None:
         complete_fetch_details(spec.dataset, fields=spec.record_fields, parent_key="team_id")
 
 
-def _snake_case(name: str) -> str:
-    out: list[str] = []
-    for ch in name:
-        if ch.isupper():
-            out.append("_")
-            out.append(ch.lower())
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _flatten_node(
-    node: dict[str, Any], *, edge_field: str | None, edge_value: Any, id_field: str = "id"
-) -> dict[str, Any]:
-    record = {_snake_case(k): v for k, v in node.items()}
-    if edge_field is not None:
-        record[_snake_case(edge_field)] = edge_value
-    if "id" not in record:
-        record["id"] = record.get(_snake_case(id_field))
-    return record
-
-
 def _error_path(err: dict[str, Any]) -> str | None:
     path = err.get("path")
     if not path:
         return None
     return ".".join(str(p) for p in path)
-
-
-@dataclass(frozen=True)
-class DatasetOutcome:
-    name: str
-    record_count: int
-    gaps: tuple[Gap, ...]
 
 
 @dataclass(frozen=True)
@@ -361,7 +333,7 @@ class _OrgLevelHarvester:
                 gaps.extend(self._record_errors("organization", self._org, errors))
                 org_data = data.get("organization") if data else None
                 if org_data is not None:
-                    writer.write_record(_flatten_node(org_data, edge_field=None, edge_value=None))
+                    writer.write_record(flatten_node(org_data, edge_field=None, edge_value=None))
                     count = 1
                 elif not errors:
                     gaps.append(
@@ -416,7 +388,7 @@ class _OrgLevelHarvester:
                 for item in items:
                     node = item["node"] if spec.edge_field else item
                     edge_value = item.get(spec.edge_field) if spec.edge_field else None
-                    record = _flatten_node(
+                    record = flatten_node(
                         node,
                         edge_field=spec.edge_field,
                         edge_value=edge_value,
@@ -485,7 +457,7 @@ class _OrgLevelHarvester:
                         break
                     for item in connection["edges"]:
                         node = item["node"]
-                        record = _flatten_node(
+                        record = flatten_node(
                             node, edge_field=spec.edge_field, edge_value=item.get(spec.edge_field)
                         )
                         record["team_id"] = team_id
