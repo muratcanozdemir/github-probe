@@ -317,7 +317,7 @@ class TestRunCommand:
 
         captured = {}
 
-        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast):
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
             captured["snapshot_root"] = snapshot_root
             return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
 
@@ -329,3 +329,150 @@ class TestRunCommand:
         )
         assert invocation.exit_code == 0
         assert captured["snapshot_root"] == custom_root
+
+
+class TestRunCommandDatasetAndRepoOptions:
+    def test_datasets_option_is_resolved_and_passed_through_ac_2_1(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--datasets", "organization,members"]
+        )
+        assert invocation.exit_code == 0
+        assert captured["dataset_names"] == ("organization", "members")
+
+    def test_no_datasets_option_passes_none_ac_2_2(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert captured["dataset_names"] is None
+
+    def test_repo_filter_flags_build_a_repository_filter_ac_2_8(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main,
+            [
+                "run",
+                "acme",
+                "--token",
+                "ghs_x",
+                "--repos",
+                "keep-a,keep-b",
+                "--exclude-archived",
+                "--exclude-forks",
+            ],
+        )
+        assert invocation.exit_code == 0
+        rf = captured["repository_filter"]
+        assert rf.names == frozenset({"keep-a", "keep-b"})
+        assert rf.exclude_archived is True
+        assert rf.exclude_forks is True
+
+    def test_no_repo_filter_flags_passes_none_not_a_noop_filter(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert captured["repository_filter"] is None
+
+    def test_max_items_per_collection_is_passed_through_ac_2_9(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--max-items-per-collection", "500"]
+        )
+        assert invocation.exit_code == 0
+        assert captured["item_cap"] == 500
+
+    def test_run_reports_auto_included_dependencies_ac_2_6(self, tmp_path, monkeypatch):
+        from org_harvest.gaps import DatasetOutcome
+        from org_harvest.manifest import build_manifest
+        from org_harvest.run import ExitStatus, RunResult
+
+        manifest = build_manifest(
+            org="acme",
+            api_host="github.com",
+            started_at="s",
+            completed_at="c",
+            dataset_selection=("issues", "repositories"),
+            dataset_outcomes=(
+                DatasetOutcome("issues", 1, ()),
+                DatasetOutcome("repositories", 1, ()),
+            ),
+        )
+        result = RunResult(
+            ExitStatus.SUCCESS,
+            tmp_path,
+            manifest,
+            1.0,
+            auto_included_datasets=("repositories",),
+        )
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--datasets", "issues"]
+        )
+        assert invocation.exit_code == 0
+        assert "auto-included dependencies: repositories" in invocation.output
+
+
+class TestPreflightAutoIncludedReporting:
+    def test_preflight_reports_auto_included_dependencies_ac_2_6(self):
+        from tests.gh_responses import preflight_response
+
+        runner = CliRunner()
+        with respx.mock(base_url=GITHUB) as mock:
+            mock.post("/graphql").mock(return_value=preflight_response())
+            result = runner.invoke(
+                main,
+                ["preflight", "acme", "--token", "ghs_x", "--datasets", "team_members"],
+            )
+        assert result.exit_code == 0
+        assert "auto-included dependencies:" in result.output
+        assert "teams" in result.output

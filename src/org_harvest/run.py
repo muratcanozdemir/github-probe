@@ -1,21 +1,23 @@
 """Wires Stories 1-9's already-tested building blocks into the single
 `run` command AC-1.1 promises: preflight (Story 4) gates the run, Phase 1
 (Story 5) then Phase 2 (Story 7's resilience wrapping Story 6) fetch the
-full default tier, Story 8 finalizes NDJSON to Parquet, and Story 9 writes
-the manifest and rebuilds the root index.
+selected tier, Story 8 finalizes NDJSON to Parquet, and Story 9 writes the
+manifest and rebuilds the root index.
 
-This module's own contribution is the exit-status enumeration (FR-10) and
-the cumulative consumption figures (AC-1.3) that Story 9 deliberately left
-for whoever drives a run end to end to compute — see `manifest.py`'s module
-docstring.
+This module's own contribution is the exit-status enumeration (FR-10), the
+cumulative consumption figures (AC-1.3) that Story 9 deliberately left for
+whoever drives a run end to end to compute (see `manifest.py`'s module
+docstring), and — as of Story 11 — resolving the dataset selection and
+repository filter before any of the above runs (AC-2.4/AC-2.5: before any
+network call).
 
-Dataset narrowing (Story 11) and resume (Story 12/13) are layered on top of
-this by later stories: this module always runs the complete default tier,
-from a fresh snapshot directory, start to finish.
+Resume (Story 12/13) is layered on top of this by a later story: this
+module always starts from a fresh snapshot directory, start to finish.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -23,7 +25,6 @@ from time import perf_counter
 
 from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import CredentialProvider
-from org_harvest.datasets import default_tier_names
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.finalize import finalize_snapshot
 from org_harvest.harvest.org_level import fetch_organization_directory
@@ -39,6 +40,7 @@ from org_harvest.manifest import (
     write_manifest,
 )
 from org_harvest.preflight import Verdict, run_preflight
+from org_harvest.selection import RepositoryFilter, resolve_dataset_selection
 from org_harvest.timeutil import utc_now_compact, utc_now_iso
 from org_harvest.transport import Transport
 
@@ -121,6 +123,10 @@ class RunResult:
     manifest: Manifest | None
     elapsed_seconds: float
     message: str | None = None
+    #: Datasets pulled in automatically because something explicitly
+    #: selected depends on them (AC-2.6) — empty when nothing needed
+    #: auto-inclusion, including every run with no `dataset_names` given.
+    auto_included_datasets: tuple[str, ...] = ()
 
 
 async def run_snapshot(
@@ -131,10 +137,18 @@ async def run_snapshot(
     snapshot_root: Path,
     api_host: ApiHost | None = None,
     fail_fast: bool = False,
+    dataset_names: Sequence[str] | None = None,
+    repository_filter: RepositoryFilter | None = None,
+    item_cap: int | None = None,
 ) -> RunResult:
     """Runs preflight, then Phase 1, then Phase 2, then finalizes and
-    writes the manifest — the complete default tier (AC-1.2), start to
-    finish, in one new snapshot directory (AC-1.5, AC-1.6, AC-1.7).
+    writes the manifest — start to finish, in one new snapshot directory
+    (AC-1.5, AC-1.6, AC-1.7). `dataset_names` (`None` for the full default
+    tier, AC-2.2) is resolved — validated, dependency-closed (AC-2.6) —
+    before anything else happens, so an invalid selection (AC-2.4, AC-2.5)
+    never reaches preflight or spends a network call. `repository_filter`
+    and `item_cap` (AC-2.8, AC-2.9) are threaded to Phase 1 and Phase 2
+    respectively.
 
     Never raises `OrgHarvestError` — every failure this function's own
     collaborators can raise is caught and turned into the matching
@@ -144,13 +158,19 @@ async def run_snapshot(
     that to `ExitStatus.USER_INTERRUPT` itself (see `cli.py`), since
     presenting an interrupt is a caller concern, not this function's."""
     host = api_host or ApiHost()
-    dataset_names = default_tier_names()
     started_perf = perf_counter()
     started_at = utc_now_iso()
 
     try:
+        selection = resolve_dataset_selection(dataset_names)
+    except OrgHarvestError as exc:
+        return RunResult(
+            exit_status_for_error(exc), None, None, perf_counter() - started_perf, str(exc)
+        )
+
+    try:
         report = await run_preflight(
-            transport, credentials, org=org, dataset_names=dataset_names, api_host=host
+            transport, credentials, org=org, dataset_names=selection.names, api_host=host
         )
     except OrgHarvestError as exc:
         return RunResult(
@@ -172,7 +192,7 @@ async def run_snapshot(
     snapshot_dir = snapshot_root / org.lower() / utc_now_compact()
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = CheckpointStore.create(
-        snapshot_dir / "checkpoint.json", org=org, dataset_selection=dataset_names
+        snapshot_dir / "checkpoint.json", org=org, dataset_selection=selection.names
     )
     guard = SystemicFailureGuard()
 
@@ -185,6 +205,8 @@ async def run_snapshot(
             api_host=host,
             checkpoint=checkpoint,
             systemic_guard=guard,
+            dataset_names=selection.names,
+            repository_filter=repository_filter,
         )
         repo_result = await fetch_repository_datasets(
             transport,
@@ -193,6 +215,8 @@ async def run_snapshot(
             api_host=host,
             checkpoint=checkpoint,
             systemic_guard=guard,
+            dataset_names=selection.names,
+            item_cap=item_cap,
         )
     except OrgHarvestError as exc:
         return RunResult(
@@ -201,6 +225,7 @@ async def run_snapshot(
             None,
             perf_counter() - started_perf,
             str(exc),
+            auto_included_datasets=selection.auto_included,
         )
 
     finalize_result = finalize_snapshot(snapshot_dir)
@@ -218,7 +243,7 @@ async def run_snapshot(
         api_host=host.host,
         started_at=started_at,
         completed_at=completed_at,
-        dataset_selection=dataset_names,
+        dataset_selection=selection.names,
         dataset_outcomes=org_result.dataset_outcomes + repo_result.dataset_outcomes,
         scope_restricted=org_result.scope_restricted,
         conversion_outcomes=finalize_result.dataset_outcomes,
@@ -232,4 +257,10 @@ async def run_snapshot(
         if manifest.status is CompletionStatus.COMPLETE
         else ExitStatus.COMPLETED_WITH_GAPS
     )
-    return RunResult(status, snapshot_dir, manifest, perf_counter() - started_perf)
+    return RunResult(
+        status,
+        snapshot_dir,
+        manifest,
+        perf_counter() - started_perf,
+        auto_included_datasets=selection.auto_included,
+    )

@@ -113,6 +113,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("issues",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "pull_requests",
@@ -120,6 +121,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("pull_requests",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "discussions",
@@ -127,6 +129,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("discussions",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "releases",
@@ -134,6 +137,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("contents",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "labels",
@@ -141,6 +145,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("issues",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "milestones",
@@ -148,6 +153,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("issues",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "collaborators",
@@ -155,6 +161,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "branch_protection_rules",
@@ -162,6 +169,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("administration",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "repo_rulesets",
@@ -169,6 +177,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("administration",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "repo_custom_property_values",
@@ -176,6 +185,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("repository_custom_properties",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "environments",
@@ -183,6 +193,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("environments",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "deployments",
@@ -190,6 +201,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("deployments",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "vulnerability_alerts",
@@ -197,6 +209,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("vulnerability_alerts",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "topics",
@@ -204,6 +217,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "languages",
@@ -211,6 +225,7 @@ _REPO_DEFAULT: tuple[DatasetSpec, ...] = (
         DatasetTier.DEFAULT,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
 )
 
@@ -223,6 +238,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("actions",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "check_suites",
@@ -230,6 +246,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("checks",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "packages",
@@ -237,6 +254,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("packages",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "forks",
@@ -244,6 +262,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "stargazers",
@@ -251,6 +270,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "watchers",
@@ -258,6 +278,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("metadata",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "dependency_graph_manifests",
@@ -265,6 +286,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("contents",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "deploy_keys",
@@ -272,6 +294,7 @@ _OPTIONAL: tuple[DatasetSpec, ...] = (
         DatasetTier.OPTIONAL,
         DatasetLevel.REPOSITORY,
         ("administration",),
+        depends_on=("repositories",),
     ),
     DatasetSpec(
         "projects_v2",

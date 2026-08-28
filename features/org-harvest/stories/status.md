@@ -16,7 +16,7 @@
 | 8 | Parquet finalization | implemented | 2026-08-28 | 2026-08-28 |
 | 9 | Snapshot manifest | implemented | 2026-08-28 | 2026-08-28 |
 | 10 | Full snapshot run | implemented | 2026-08-28 | 2026-08-28 |
-| 11 | Dataset selection | not-started | - | - |
+| 11 | Dataset selection | implemented | 2026-08-28 | 2026-08-28 |
 | 12 | Automatic resume | not-started | - | - |
 | 13 | Resume safety guards | not-started | - | - |
 | 14 | Retry gaps | not-started | - | - |

@@ -16,11 +16,12 @@ from typing import Any
 import click
 
 from org_harvest.credentials import CredentialProvider, build_credential_provider
-from org_harvest.datasets import all_specs, default_tier_names, get
-from org_harvest.errors import ErrorKind, OrgHarvestError
+from org_harvest.datasets import all_specs
+from org_harvest.errors import OrgHarvestError
 from org_harvest.hosts import ApiHost
 from org_harvest.preflight import PreflightReport, Verdict, run_preflight
 from org_harvest.run import ExitStatus, RunResult, exit_status_for_error, run_snapshot
+from org_harvest.selection import RepositoryFilter, resolve_dataset_selection
 from org_harvest.transport import Transport
 
 #: Default snapshot root (AC-1.6) — relative to the current working
@@ -121,20 +122,14 @@ async def _do_auth_check(provider: CredentialProvider) -> None:
         await provider.aclose()
 
 
-def _parse_dataset_selection(datasets: str | None) -> tuple[str, ...]:
-    """Resolves a comma-separated `--datasets` option into validated names,
-    defaulting to the full default tier (AC-2.2, AC-2.7's listing companion).
-    Unknown names surface via `get()`'s own error before any network call."""
-    if datasets is None:
-        return default_tier_names()
-    names = tuple(name.strip() for name in datasets.split(",") if name.strip())
-    if not names:
-        raise OrgHarvestError(
-            "--datasets resolved to an empty selection.", kind=ErrorKind.INVALID_USAGE
-        )
-    for name in names:
-        get(name)  # raises INVALID_USAGE on an unknown name, listing valid ones
-    return names
+def _split_csv_option(value: str | None) -> tuple[str, ...] | None:
+    """Splits a comma-separated CLI option into a tuple of trimmed,
+    non-empty names, or `None` when the option wasn't given at all —
+    distinct from an empty tuple, which `resolve_dataset_selection()`
+    (AC-2.5) and `--repos` both treat as "nothing to restrict to"."""
+    if value is None:
+        return None
+    return tuple(name.strip() for name in value.split(",") if name.strip())
 
 
 @main.group("datasets")
@@ -176,7 +171,7 @@ def preflight(
     same condition instead of proceeding with a warning (AC-6.4)."""
     _warn_if_token_on_command_line(ctx)
     try:
-        dataset_names = _parse_dataset_selection(datasets)
+        selection = resolve_dataset_selection(_split_csv_option(datasets))
         provider = build_credential_provider(
             private_key_path=app_private_key_path,
             client_id=app_client_id,
@@ -185,8 +180,10 @@ def preflight(
             api_host=ApiHost(api_host),
         )
         report = _run_async(
-            _do_preflight(provider, org=org, dataset_names=dataset_names, api_host=api_host)
+            _do_preflight(provider, org=org, dataset_names=selection.names, api_host=api_host)
         )
+        if selection.auto_included:
+            click.echo(f"auto-included dependencies: {', '.join(selection.auto_included)}")
         _print_preflight_report(report)
         if report.any_blocked:
             sys.exit(1)
@@ -241,6 +238,36 @@ def _print_preflight_report(report: PreflightReport) -> None:
     help="Abort before downloading anything if preflight finds a blocked dataset, "
     "instead of proceeding and recording it as a gap (AC-6.4).",
 )
+@click.option(
+    "--datasets",
+    default=None,
+    help="Comma-separated dataset names (default: all default-tier). Naming an "
+    "optional dataset enables it; a dataset's dependencies are included "
+    "automatically (AC-2.1, AC-2.3, AC-2.6).",
+)
+@click.option(
+    "--repos",
+    default=None,
+    help="Comma-separated repository names to restrict the run to (AC-2.8).",
+)
+@click.option(
+    "--exclude-archived",
+    is_flag=True,
+    default=False,
+    help="Exclude archived repositories from the run (AC-2.8).",
+)
+@click.option(
+    "--exclude-forks",
+    is_flag=True,
+    default=False,
+    help="Exclude forked repositories from the run (AC-2.8).",
+)
+@click.option(
+    "--max-items-per-collection",
+    type=int,
+    default=None,
+    help="Cap the number of items collected per repository-level collection (AC-2.9).",
+)
 @_credential_options
 @click.pass_context
 def run(
@@ -248,6 +275,11 @@ def run(
     org: str,
     snapshot_root: Path,
     fail_fast: bool,
+    datasets: str | None,
+    repos: str | None,
+    exclude_archived: bool,
+    exclude_forks: bool,
+    max_items_per_collection: int | None,
     app_private_key_path: str | None,
     app_client_id: str | None,
     token: str | None,
@@ -267,6 +299,13 @@ def run(
         click.echo(f"error: {exc}", err=True)
         sys.exit(exit_status_for_error(exc))
 
+    repo_names = _split_csv_option(repos)
+    repository_filter = RepositoryFilter(
+        names=frozenset(repo_names) if repo_names else None,
+        exclude_archived=exclude_archived,
+        exclude_forks=exclude_forks,
+    )
+
     try:
         result = _run_async(
             _do_run(
@@ -275,6 +314,9 @@ def run(
                 snapshot_root=snapshot_root,
                 api_host=api_host,
                 fail_fast=fail_fast,
+                dataset_names=_split_csv_option(datasets),
+                repository_filter=None if repository_filter.is_noop else repository_filter,
+                item_cap=max_items_per_collection,
             )
         )
     except KeyboardInterrupt:
@@ -292,6 +334,9 @@ async def _do_run(
     snapshot_root: Path,
     api_host: str,
     fail_fast: bool,
+    dataset_names: tuple[str, ...] | None = None,
+    repository_filter: RepositoryFilter | None = None,
+    item_cap: int | None = None,
 ) -> RunResult:
     transport = Transport(provider)
     try:
@@ -302,6 +347,9 @@ async def _do_run(
             snapshot_root=snapshot_root,
             api_host=ApiHost(api_host),
             fail_fast=fail_fast,
+            dataset_names=dataset_names,
+            repository_filter=repository_filter,
+            item_cap=item_cap,
         )
     finally:
         await transport.aclose()
@@ -310,6 +358,8 @@ async def _do_run(
 
 def _print_run_result(result: RunResult) -> None:
     manifest = result.manifest
+    if result.auto_included_datasets:
+        click.echo(f"auto-included dependencies: {', '.join(result.auto_included_datasets)}")
     if manifest is not None:
         for name, count in sorted(manifest.dataset_counts.items()):
             click.echo(f"  {name}: {count}")

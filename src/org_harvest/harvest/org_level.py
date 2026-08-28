@@ -29,13 +29,14 @@ one-place, non-breaking change to the tables below.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import CredentialProvider
-from org_harvest.datasets import complete_fetch_details
+from org_harvest.datasets import DatasetLevel, complete_fetch_details, get
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.graphql import extract_rate_limit_snapshot
@@ -43,6 +44,7 @@ from org_harvest.harvest.flatten import flatten_node
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.output import NdjsonWriter
+from org_harvest.selection import RepositoryFilter
 from org_harvest.transport import Transport
 
 _DEFAULT_PAGE_SIZE = 100
@@ -262,6 +264,7 @@ class _OrgLevelHarvester:
         checkpoint: CheckpointStore,
         page_size: int,
         systemic_guard: SystemicFailureGuard,
+        repository_filter: RepositoryFilter,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -270,6 +273,7 @@ class _OrgLevelHarvester:
         self._checkpoint = checkpoint
         self._page_size = page_size
         self._systemic_guard = systemic_guard
+        self._repository_filter = repository_filter
 
     def _writer(self, dataset: str) -> NdjsonWriter:
         return NdjsonWriter(self._snapshot_dir / f"{dataset}.ndjson")
@@ -399,6 +403,12 @@ class _OrgLevelHarvester:
                         edge_value=edge_value,
                         id_field=spec.id_field,
                     )
+                    if spec.dataset == "repositories" and not self._repository_filter.allows(
+                        name=str(record.get("name", "")),
+                        is_archived=bool(record.get("is_archived")),
+                        is_fork=bool(record.get("is_fork")),
+                    ):
+                        continue
                     writer.write_record(record)
                     count += 1
                 page_info = connection["pageInfo"]
@@ -494,12 +504,22 @@ async def fetch_organization_directory(
     page_size: int = _DEFAULT_PAGE_SIZE,
     checkpoint: CheckpointStore | None = None,
     systemic_guard: SystemicFailureGuard | None = None,
+    dataset_names: Sequence[str] | None = None,
+    repository_filter: RepositoryFilter | None = None,
 ) -> OrgLevelResult:
-    """Fetches every organization-level default-tier dataset (AC-1.2) and
-    writes each to `snapshot_dir` as NDJSON. Always fetches the full
-    org-level default tier unconditionally — dataset narrowing (Story 11)
-    and resume (Story 12) are layered on top of this by later stories, not
-    implemented here.
+    """Fetches organization-level datasets (AC-1.2) and writes each to
+    `snapshot_dir` as NDJSON. `dataset_names` narrows or expands the
+    default org-level tier (Story 11, AC-2.1/AC-2.3) — `None` (the
+    default) fetches every org-level dataset in `ORG_LEVEL_DATASET_NAMES`,
+    matching this function's pre-Story-11 behavior exactly. A selected
+    name this module has no connection spec for (an optional-tier dataset
+    Story 11 makes *selectable* without implementing its fetch — see
+    story-11's Scope) becomes a single explicit gap rather than silently
+    producing nothing, consistent with never presenting an incomplete
+    result as complete. `repository_filter` (AC-2.8) is applied while
+    writing the `repositories` dataset, which is also Phase 2's fan-out
+    source (architecture.md, Decision 4) — filtering there narrows both at
+    once.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 2 by the caller if desired, or left
@@ -507,11 +527,17 @@ async def fetch_organization_directory(
     consecutive-failure or failure-rate threshold partway through."""
     register_fetch_details()
     host = api_host or ApiHost()
+    selected = set(dataset_names) if dataset_names is not None else None
+    effective_selection = (
+        ORG_LEVEL_DATASET_NAMES
+        if selected is None
+        else tuple(name for name in ORG_LEVEL_DATASET_NAMES if name in selected)
+    )
     if checkpoint is None:
         checkpoint = CheckpointStore.create(
             snapshot_dir / "checkpoint.json",
             org=org,
-            dataset_selection=ORG_LEVEL_DATASET_NAMES,
+            dataset_selection=effective_selection,
         )
     harvester = _OrgLevelHarvester(
         transport,
@@ -521,28 +547,57 @@ async def fetch_organization_directory(
         checkpoint=checkpoint,
         page_size=page_size,
         systemic_guard=systemic_guard or SystemicFailureGuard(),
+        repository_filter=repository_filter or RepositoryFilter(),
     )
 
-    outcomes: list[DatasetOutcome] = [await harvester.fetch_organization_scalar()]
+    outcomes: list[DatasetOutcome] = []
+    if selected is None or "organization" in selected:
+        outcomes.append(await harvester.fetch_organization_scalar())
 
     connections_by_name = {spec.dataset: spec for spec in _ORG_CONNECTIONS}
+    reachable_repository_count = 0
     for name in ("members", "pending_members", "teams", "repositories"):
-        outcomes.append(await harvester.fetch_org_connection(connections_by_name[name]))
-    repositories_outcome = outcomes[-1]
+        if selected is not None and name not in selected:
+            continue
+        outcome = await harvester.fetch_org_connection(connections_by_name[name])
+        outcomes.append(outcome)
+        if name == "repositories":
+            reachable_repository_count = outcome.record_count
     for name in ("org_rulesets", "org_custom_properties", "org_domains", "org_ip_allow_list"):
-        outcomes.append(await harvester.fetch_org_connection(connections_by_name[name]))
+        if selected is None or name in selected:
+            outcomes.append(await harvester.fetch_org_connection(connections_by_name[name]))
 
-    teams = _read_ndjson(snapshot_dir / "teams.ndjson")
     team_connections_by_name = {spec.dataset: spec for spec in _TEAM_CONNECTIONS}
-    outcomes.append(
-        await harvester.fetch_team_connection(team_connections_by_name["team_members"], teams)
-    )
-    outcomes.append(
-        await harvester.fetch_team_connection(team_connections_by_name["team_repositories"], teams)
-    )
+    needs_team_members = selected is None or "team_members" in selected
+    needs_team_repositories = selected is None or "team_repositories" in selected
+    if needs_team_members or needs_team_repositories:
+        teams = _read_ndjson(snapshot_dir / "teams.ndjson")
+        if needs_team_members:
+            outcomes.append(
+                await harvester.fetch_team_connection(
+                    team_connections_by_name["team_members"], teams
+                )
+            )
+        if needs_team_repositories:
+            outcomes.append(
+                await harvester.fetch_team_connection(
+                    team_connections_by_name["team_repositories"], teams
+                )
+            )
+
+    if selected is not None:
+        implemented = {"organization", *connections_by_name, *team_connections_by_name}
+        for name in sorted(selected - implemented):
+            if get(name).level is not DatasetLevel.ORGANIZATION:
+                continue
+            gap = Gap.now(
+                name, resource_id=None, field_path=None, reason="dataset not yet implemented"
+            )
+            checkpoint.record_gap(gap)
+            outcomes.append(DatasetOutcome(name, 0, (gap,)))
 
     return OrgLevelResult(
         dataset_outcomes=tuple(outcomes),
         scope_restricted=credentials.repository_selection == "selected",
-        reachable_repository_count=repositories_outcome.record_count,
+        reachable_repository_count=reachable_repository_count,
     )

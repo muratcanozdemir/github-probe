@@ -367,11 +367,12 @@ class TestNodeLimitRetry:
             page_size=50,
             batch_width=10,
             systemic_guard=SystemicFailureGuard(),
+            item_cap=None,
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
             router.post("/graphql").mock(side_effect=handler)
-            result = await harvester._run_batch(spec, [_RepoState(id="R_1", name="repo1")], 50)
+            result = await harvester._run_batch(spec, [_RepoState(id="R_1", name="repo1")], 50, {})
         harvester.close_writers()
         assert result.written == 1
         assert min(page_sizes_seen) <= 5
@@ -413,12 +414,13 @@ class TestNodeLimitRetry:
             page_size=4,
             batch_width=2,
             systemic_guard=SystemicFailureGuard(),
+            item_cap=None,
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         batch = [_RepoState(id="R_1", name="repo1"), _RepoState(id="R_2", name="repo2")]
         with respx.mock(base_url=GITHUB) as router:
             router.post("/graphql").mock(side_effect=handler)
-            result = await harvester._run_batch(spec, batch, 4)
+            result = await harvester._run_batch(spec, batch, 4, {})
         harvester.close_writers()
         assert result.written == 2
         assert result.gaps == []
@@ -452,11 +454,12 @@ class TestNodeLimitRetry:
             page_size=1,
             batch_width=1,
             systemic_guard=SystemicFailureGuard(),
+            item_cap=None,
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
             router.post("/graphql").mock(side_effect=always_node_limit)
-            result = await harvester._run_batch(spec, [_RepoState(id="R_1", name="repo1")], 1)
+            result = await harvester._run_batch(spec, [_RepoState(id="R_1", name="repo1")], 1, {})
         harvester.close_writers()
         assert result.written == 0
         assert len(result.gaps) == 1
@@ -525,4 +528,176 @@ class TestSystemicFailure:
         # Tripped after exactly 5 failed requests (one per dataset attempted
         # so far), not 25 — proving the guard counts requests, not repos.
         assert guard.total_attempts == 5
+        await transport.aclose()
+
+
+def _multi_page_issues_handler(pages: dict[str, list[dict]]):
+    """Builds a handler serving `issues` from an in-memory page table keyed
+    by cursor (`None` for the first page), and falling back to the
+    fixed-page happy-path handler for every other dataset — used to
+    exercise cross-dataset cursor isolation and the per-repo item cap
+    (Story 11), neither of which the single-page happy-path fixtures can
+    reach."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        query = body["query"]
+        if "issues(" not in query:
+            return _happy_path_handler(request)
+        cursor = body["variables"].get("repo0_cursor")
+        page = pages[cursor]
+        data = {
+            "repo0": {
+                "id": "R_1",
+                "issues": {
+                    "pageInfo": {"hasNextPage": page["has_next"], "endCursor": page["cursor"]},
+                    "nodes": page["nodes"],
+                },
+            }
+        }
+        return httpx.Response(200, json={"data": {"rateLimit": _rate_limit(), **data}})
+
+    return handler
+
+
+def _issue_node(n: int) -> dict[str, Any]:
+    node = dict(_CANNED_NODES["issues"])
+    node["id"] = f"I_{n}"
+    node["number"] = n
+    return node
+
+
+class TestDatasetNarrowing:
+    async def test_only_selected_datasets_are_fetched(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues", "labels"),
+            )
+        assert {o.name for o in result.dataset_outcomes} == {"issues", "labels"}
+        assert not (snapshot_dir / "pull_requests.ndjson").exists()
+        await transport.aclose()
+
+    async def test_none_means_the_full_default_tier_unchanged(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            result = await fetch_repository_datasets(
+                transport, org="acme", snapshot_dir=snapshot_dir, dataset_names=None
+            )
+        assert {o.name for o in result.dataset_outcomes} == set(REPO_LEVEL_DATASET_NAMES)
+        await transport.aclose()
+
+    async def test_selecting_an_unimplemented_optional_dataset_becomes_a_gap(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues", "workflow_runs"),
+            )
+        by_name = {o.name: o for o in result.dataset_outcomes}
+        assert by_name["workflow_runs"].record_count == 0
+        assert len(by_name["workflow_runs"].gaps) == 1
+        assert "not yet implemented" in by_name["workflow_runs"].gaps[0].reason
+        await transport.aclose()
+
+
+class TestItemCap:
+    async def test_stops_collecting_once_the_cap_is_reached_ac_2_9(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        pages = {
+            None: {"has_next": True, "cursor": "C1", "nodes": [_issue_node(1), _issue_node(2)]},
+            "C1": {"has_next": True, "cursor": "C2", "nodes": [_issue_node(3)]},
+        }
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_multi_page_issues_handler(pages))
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues",),
+                item_cap=2,
+            )
+        outcome = result.dataset_outcomes[0]
+        assert outcome.record_count == 2
+        assert outcome.gaps == ()  # capped, not failed
+        issues = _read_lines(snapshot_dir / "issues.ndjson")
+        assert [i["id"] for i in issues] == ["I_1", "I_2"]
+        await transport.aclose()
+
+    async def test_uncapped_by_default_collects_every_page(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        pages = {
+            None: {"has_next": True, "cursor": "C1", "nodes": [_issue_node(1), _issue_node(2)]},
+            "C1": {"has_next": False, "cursor": None, "nodes": [_issue_node(3)]},
+        }
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_multi_page_issues_handler(pages))
+            result = await fetch_repository_datasets(
+                transport, org="acme", snapshot_dir=snapshot_dir, dataset_names=("issues",)
+            )
+        assert result.dataset_outcomes[0].record_count == 3
+        await transport.aclose()
+
+
+class TestCursorIsolationAcrossDatasets:
+    async def test_a_multi_page_datasets_cursor_does_not_leak_into_the_next_dataset(
+        self, tmp_path: Path
+    ):
+        """Regression: `_RepoState` objects are shared across every
+        dataset's fetch within one `fetch_repository_datasets()` call — a
+        cursor left over from a previous, multi-page dataset must not seed
+        the next dataset's first page for the same repository."""
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        pages = {
+            None: {"has_next": True, "cursor": "C1", "nodes": [_issue_node(1)]},
+            "C1": {"has_next": False, "cursor": None, "nodes": [_issue_node(2)]},
+        }
+        seen_cursors: list[Any] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["query"]
+            if "issues(" in query:
+                return _multi_page_issues_handler(pages)(request)
+            if "pullRequests(" in query:
+                seen_cursors.append(body["variables"].get("repo0_cursor"))
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues", "pull_requests"),
+            )
+        # pull_requests' very first request for R_1 must start at cursor
+        # None, not at "C1" (issues' second-to-last page cursor).
+        assert seen_cursors == [None]
         await transport.aclose()

@@ -16,6 +16,7 @@ from org_harvest.harvest.org_level import (
     fetch_organization_directory,
 )
 from org_harvest.harvest.systemic import SystemicFailureGuard
+from org_harvest.selection import RepositoryFilter
 from org_harvest.transport import Transport
 
 GITHUB = "https://api.github.com"
@@ -440,6 +441,7 @@ class TestPagination:
             # rest of the full-directory fetch for this pagination-focused test.
             from org_harvest.checkpoint import CheckpointStore
             from org_harvest.harvest.org_level import _ORG_CONNECTIONS, _OrgLevelHarvester
+            from org_harvest.selection import RepositoryFilter
 
             checkpoint = CheckpointStore.create(
                 snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("members",)
@@ -452,6 +454,7 @@ class TestPagination:
                 checkpoint=checkpoint,
                 page_size=1,
                 systemic_guard=SystemicFailureGuard(),
+                repository_filter=RepositoryFilter(),
             )
             spec = next(s for s in _ORG_CONNECTIONS if s.dataset == "members")
             outcome = await harvester.fetch_org_connection(spec)
@@ -645,4 +648,182 @@ class TestSystemicFailure:
         # partial error was never reported as a "no response" attempt.
         assert result.has_gaps
         assert guard.consecutive_failures == 0
+        await transport.aclose()
+
+
+class TestDatasetNarrowing:
+    async def test_only_selected_datasets_are_fetched(self, tmp_path: Path):
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with _happy_path_dispatcher():
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "members"),
+            )
+        assert {o.name for o in result.dataset_outcomes} == {"organization", "members"}
+        assert not (snapshot_dir / "teams.ndjson").exists()
+        await transport.aclose()
+
+    async def test_none_means_the_full_default_tier_unchanged(self, tmp_path: Path):
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with _happy_path_dispatcher():
+            result = await fetch_organization_directory(
+                transport, provider, org="acme", snapshot_dir=snapshot_dir, dataset_names=None
+            )
+        assert {o.name for o in result.dataset_outcomes} == set(ORG_LEVEL_DATASET_NAMES)
+        await transport.aclose()
+
+    async def test_team_members_alone_still_reads_teams_written_by_this_same_selection(
+        self, tmp_path: Path
+    ):
+        """Mirrors what `resolve_dataset_selection()` would hand this
+        function after auto-including `teams` (AC-2.6) — exercised here
+        directly against `org_level.py`'s own narrowing."""
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with _happy_path_dispatcher():
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("teams", "team_members"),
+            )
+        assert {o.name for o in result.dataset_outcomes} == {"teams", "team_members"}
+        team_members = _read_lines(snapshot_dir / "team_members.ndjson")
+        assert team_members[0]["team_id"] == "T_1"
+        await transport.aclose()
+
+    async def test_selecting_an_unimplemented_optional_dataset_becomes_a_gap(self, tmp_path: Path):
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with _happy_path_dispatcher():
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "audit_log"),
+            )
+        by_name = {o.name: o for o in result.dataset_outcomes}
+        assert by_name["audit_log"].record_count == 0
+        assert len(by_name["audit_log"].gaps) == 1
+        assert "not yet implemented" in by_name["audit_log"].gaps[0].reason
+        await transport.aclose()
+
+
+def _repo_node(n: int, *, is_archived: bool = False, is_fork: bool = False) -> dict:
+    return {
+        "id": f"R_{n}",
+        "databaseId": n,
+        "name": f"repo{n}",
+        "nameWithOwner": f"acme/repo{n}",
+        "isPrivate": False,
+        "isArchived": is_archived,
+        "isFork": is_fork,
+        "isDisabled": False,
+        "isEmpty": False,
+        "visibility": "PUBLIC",
+        "createdAt": "2017-01-01T00:00:00Z",
+        "updatedAt": "2017-01-01T00:00:00Z",
+        "pushedAt": "2017-01-01T00:00:00Z",
+    }
+
+
+def _repositories_handler(nodes: list[dict]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = json.loads(request.content)["query"]
+        if "repositories(" not in query:
+            return _happy_path_handler(request)
+        data = {
+            "organization": {"repositories": {"pageInfo": _page_info(False, None), "nodes": nodes}}
+        }
+        return httpx.Response(200, json={"data": {"rateLimit": _rate_limit(), **data}})
+
+    return handler
+
+
+class TestRepositoryFilter:
+    async def test_excludes_archived_repositories_ac_2_8(self, tmp_path: Path):
+        nodes = [_repo_node(1), _repo_node(2, is_archived=True)]
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_repositories_handler(nodes))
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("repositories",),
+                repository_filter=RepositoryFilter(exclude_archived=True),
+            )
+        repos = _read_lines(snapshot_dir / "repositories.ndjson")
+        assert [r["name"] for r in repos] == ["repo1"]
+        assert result.reachable_repository_count == 1
+        await transport.aclose()
+
+    async def test_excludes_forks_ac_2_8(self, tmp_path: Path):
+        nodes = [_repo_node(1), _repo_node(2, is_fork=True)]
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_repositories_handler(nodes))
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("repositories",),
+                repository_filter=RepositoryFilter(exclude_forks=True),
+            )
+        repos = _read_lines(snapshot_dir / "repositories.ndjson")
+        assert [r["name"] for r in repos] == ["repo1"]
+        await transport.aclose()
+
+    async def test_name_allowlist_restricts_to_named_repositories_ac_2_8(self, tmp_path: Path):
+        nodes = [_repo_node(1), _repo_node(2)]
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_repositories_handler(nodes))
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("repositories",),
+                repository_filter=RepositoryFilter(names=frozenset({"repo2"})),
+            )
+        repos = _read_lines(snapshot_dir / "repositories.ndjson")
+        assert [r["name"] for r in repos] == ["repo2"]
+        await transport.aclose()
+
+    async def test_no_filter_keeps_every_repository(self, tmp_path: Path):
+        nodes = [_repo_node(1), _repo_node(2, is_archived=True), _repo_node(3, is_fork=True)]
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_repositories_handler(nodes))
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("repositories",),
+            )
+        repos = _read_lines(snapshot_dir / "repositories.ndjson")
+        assert len(repos) == 3
         await transport.aclose()

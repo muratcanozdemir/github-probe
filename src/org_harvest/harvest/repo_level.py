@@ -36,12 +36,13 @@ as a whole, and either dimension alone may not be enough to fit under it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from org_harvest.checkpoint import CheckpointStore
-from org_harvest.datasets import complete_fetch_details
+from org_harvest.datasets import DatasetLevel, complete_fetch_details, get
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
 from org_harvest.graphql import extract_rate_limit_snapshot
@@ -330,6 +331,7 @@ class _RepoLevelHarvester:
         page_size: int,
         batch_width: int,
         systemic_guard: SystemicFailureGuard,
+        item_cap: int | None,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -340,6 +342,10 @@ class _RepoLevelHarvester:
         self._batch_width = batch_width
         self._writers: dict[str, NdjsonWriter] = {}
         self._systemic_guard = systemic_guard
+        #: AC-2.9 — caps how many items `fetch_repo_dataset` collects per
+        #: repository for the dataset it's currently fetching. `None` means
+        #: uncapped (pre-Story-11 behavior).
+        self._item_cap = item_cap
 
     async def _query(
         self, query: str, variables: dict[str, Any]
@@ -390,7 +396,11 @@ class _RepoLevelHarvester:
         return query, variables
 
     async def _run_batch(
-        self, spec: _RepoConnectionSpec, batch: list[_RepoState], page_size: int
+        self,
+        spec: _RepoConnectionSpec,
+        batch: list[_RepoState],
+        page_size: int,
+        written_per_repo: dict[str, int],
     ) -> _BatchResult:
         query, variables = self._build_query(spec, batch, page_size)
         data, errors, transport_failure = await self._query(query, variables)
@@ -403,11 +413,13 @@ class _RepoLevelHarvester:
 
         if any(_is_node_limit_error(e) for e in errors):
             if page_size > _MIN_PAGE_SIZE:
-                return await self._run_batch(spec, batch, max(_MIN_PAGE_SIZE, page_size // 2))
+                return await self._run_batch(
+                    spec, batch, max(_MIN_PAGE_SIZE, page_size // 2), written_per_repo
+                )
             if len(batch) > 1:
                 mid = len(batch) // 2
-                left = await self._run_batch(spec, batch[:mid], self._page_size)
-                right = await self._run_batch(spec, batch[mid:], self._page_size)
+                left = await self._run_batch(spec, batch[:mid], self._page_size, written_per_repo)
+                right = await self._run_batch(spec, batch[mid:], self._page_size, written_per_repo)
                 return _BatchResult(
                     written=left.written + right.written,
                     gaps=[*left.gaps, *right.gaps],
@@ -465,7 +477,10 @@ class _RepoLevelHarvester:
             else:
                 items = connection
 
+            written_so_far = written_per_repo.get(repo.id, 0)
             for item in items:
+                if self._item_cap is not None and written_so_far >= self._item_cap:
+                    break
                 node = item["node"] if spec.edge_field and spec.paginated else item
                 edge_value = (
                     item.get(spec.edge_field) if spec.edge_field and spec.paginated else None
@@ -476,10 +491,13 @@ class _RepoLevelHarvester:
                 record["repository_id"] = repo.id
                 self._writer(spec.dataset).write_record(record)
                 result.written += 1
+                written_so_far += 1
+            written_per_repo[repo.id] = written_so_far
 
             if spec.paginated:
                 page_info = connection["pageInfo"]
-                if page_info["hasNextPage"]:
+                reached_cap = self._item_cap is not None and written_so_far >= self._item_cap
+                if page_info["hasNextPage"] and not reached_cap:
                     repo.cursor = page_info["endCursor"]
                     result.still_pending.append(repo)
                     self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", repo.cursor)
@@ -504,12 +522,19 @@ class _RepoLevelHarvester:
     async def fetch_repo_dataset(
         self, spec: _RepoConnectionSpec, repos: list[_RepoState]
     ) -> DatasetOutcome:
+        # Each `_RepoState` is shared across every dataset's fetch (the same
+        # objects are reused for every spec in `fetch_repository_datasets`'s
+        # loop) — reset cursor here so a previous dataset's pagination
+        # progress never leaks into this one's first page.
+        for repo in repos:
+            repo.cursor = None
         queue = list(repos)
         count = 0
         gaps: list[Gap] = []
+        written_per_repo: dict[str, int] = {}
         while queue:
             batch, queue = queue[: self._batch_width], queue[self._batch_width :]
-            result = await self._run_batch(spec, batch, self._page_size)
+            result = await self._run_batch(spec, batch, self._page_size, written_per_repo)
             count += result.written
             gaps.extend(result.gaps)
             queue.extend(result.still_pending)
@@ -533,12 +558,24 @@ async def fetch_repository_datasets(
     batch_width: int = _DEFAULT_BATCH_WIDTH,
     checkpoint: CheckpointStore | None = None,
     systemic_guard: SystemicFailureGuard | None = None,
+    dataset_names: Sequence[str] | None = None,
+    item_cap: int | None = None,
 ) -> RepoLevelResult:
-    """Fetches every repository-level default-tier dataset (AC-1.2) for
-    every repository Story 5 wrote to `repositories.ndjson`, and writes
-    each dataset to `snapshot_dir` as NDJSON. Requires Phase 1 to have
-    already run in this `snapshot_dir` (architecture.md, Decision 4) — an
-    empty repository list is a valid, empty result, not an error (EC-1).
+    """Fetches repository-level datasets (AC-1.2) for every repository
+    Story 5 wrote to `repositories.ndjson`, and writes each dataset to
+    `snapshot_dir` as NDJSON. Requires Phase 1 to have already run in this
+    `snapshot_dir` (architecture.md, Decision 4) — an empty repository
+    list is a valid, empty result, not an error (EC-1).
+
+    `dataset_names` narrows or expands the default repo-level tier (Story
+    11, AC-2.1/AC-2.3) the same way `fetch_organization_directory`'s does
+    — `None` fetches every dataset in `REPO_LEVEL_DATASET_NAMES`, matching
+    this function's pre-Story-11 behavior exactly; a selected name with no
+    connection spec here (an optional-tier dataset Story 11 makes
+    *selectable* without implementing its fetch) becomes a single explicit
+    gap. `item_cap` (AC-2.9) stops collecting further items for a
+    repository, dataset pair once that many have been written, even if
+    more pages remain.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 1 by the caller if desired, or left
@@ -546,11 +583,17 @@ async def fetch_repository_datasets(
     consecutive-failure or failure-rate threshold partway through."""
     register_fetch_details()
     host = api_host or ApiHost()
+    selected = set(dataset_names) if dataset_names is not None else None
+    effective_selection = (
+        REPO_LEVEL_DATASET_NAMES
+        if selected is None
+        else tuple(name for name in REPO_LEVEL_DATASET_NAMES if name in selected)
+    )
     if checkpoint is None:
         checkpoint = CheckpointStore.create(
             snapshot_dir / "checkpoint.json",
             org=org,
-            dataset_selection=REPO_LEVEL_DATASET_NAMES,
+            dataset_selection=effective_selection,
         )
     repos = _read_repositories(snapshot_dir)
     harvester = _RepoLevelHarvester(
@@ -562,11 +605,25 @@ async def fetch_repository_datasets(
         page_size=page_size,
         batch_width=batch_width,
         systemic_guard=systemic_guard or SystemicFailureGuard(),
+        item_cap=item_cap,
     )
     outcomes = []
     try:
         for spec in _REPO_CONNECTIONS:
-            outcomes.append(await harvester.fetch_repo_dataset(spec, list(repos)))
+            if selected is None or spec.dataset in selected:
+                outcomes.append(await harvester.fetch_repo_dataset(spec, list(repos)))
     finally:
         harvester.close_writers()
+
+    if selected is not None:
+        implemented = {spec.dataset for spec in _REPO_CONNECTIONS}
+        for name in sorted(selected - implemented):
+            if get(name).level is not DatasetLevel.REPOSITORY:
+                continue
+            gap = Gap.now(
+                name, resource_id=None, field_path=None, reason="dataset not yet implemented"
+            )
+            checkpoint.record_gap(gap)
+            outcomes.append(DatasetOutcome(name, 0, (gap,)))
+
     return RepoLevelResult(dataset_outcomes=tuple(outcomes))
