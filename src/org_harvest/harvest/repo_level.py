@@ -49,6 +49,7 @@ from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
+from org_harvest.interrupt import InterruptGuard
 from org_harvest.output import NdjsonWriter, count_records
 from org_harvest.transport import Transport
 
@@ -332,6 +333,7 @@ class _RepoLevelHarvester:
         batch_width: int,
         systemic_guard: SystemicFailureGuard,
         item_cap: int | None,
+        interrupt: InterruptGuard,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -346,6 +348,12 @@ class _RepoLevelHarvester:
         #: repository for the dataset it's currently fetching. `None` means
         #: uncapped (pre-Story-11 behavior).
         self._item_cap = item_cap
+        self._interrupt = interrupt
+
+    @property
+    def interrupted(self) -> bool:
+        """Story 13, AC-4.11 — mirrors `_OrgLevelHarvester.interrupted`."""
+        return self._interrupt.requested
 
     async def _query(
         self, query: str, variables: dict[str, Any]
@@ -553,11 +561,14 @@ class _RepoLevelHarvester:
         gaps: list[Gap] = []
         written_per_repo: dict[str, int] = {}
         while queue:
+            if self.interrupted:
+                break
             batch, queue = queue[: self._batch_width], queue[self._batch_width :]
             result = await self._run_batch(spec, batch, self._page_size, written_per_repo)
             gaps.extend(result.gaps)
             queue.extend(result.still_pending)
-        self._checkpoint.set_dataset_status(spec.dataset, "complete")
+        if not self.interrupted:
+            self._checkpoint.set_dataset_status(spec.dataset, "complete")
         path = self._snapshot_dir / f"{spec.dataset}.ndjson"
         return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
 
@@ -590,6 +601,7 @@ async def fetch_repository_datasets(
     systemic_guard: SystemicFailureGuard | None = None,
     dataset_names: Sequence[str] | None = None,
     item_cap: int | None = None,
+    interrupt: InterruptGuard | None = None,
 ) -> RepoLevelResult:
     """Fetches repository-level datasets (AC-1.2) for every repository
     Story 5 wrote to `repositories.ndjson`, and writes each dataset to
@@ -636,16 +648,19 @@ async def fetch_repository_datasets(
         batch_width=batch_width,
         systemic_guard=systemic_guard or SystemicFailureGuard(),
         item_cap=item_cap,
+        interrupt=interrupt or InterruptGuard(),
     )
     outcomes = []
     try:
         for spec in _REPO_CONNECTIONS:
+            if harvester.interrupted:
+                break
             if selected is None or spec.dataset in selected:
                 outcomes.append(await harvester.fetch_repo_dataset(spec, list(repos)))
     finally:
         harvester.close_writers()
 
-    if selected is not None:
+    if selected is not None and not harvester.interrupted:
         implemented = {spec.dataset for spec in _REPO_CONNECTIONS}
         for name in sorted(selected - implemented):
             if get(name).level is not DatasetLevel.REPOSITORY:

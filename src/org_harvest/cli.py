@@ -282,6 +282,20 @@ def _print_preflight_report(report: PreflightReport) -> None:
     help="Start a brand-new snapshot even if an incomplete one exists for this "
     "org (AC-4.7), instead of resuming it automatically.",
 )
+@click.option(
+    "--stale-after-days",
+    type=float,
+    default=7.0,
+    show_default=True,
+    help="Refuse to resume a snapshot older than this many days (AC-4.10), unless "
+    "--allow-stale-resume is also given.",
+)
+@click.option(
+    "--allow-stale-resume",
+    is_flag=True,
+    default=False,
+    help="Resume a snapshot even if it's older than --stale-after-days (AC-4.10).",
+)
 @_credential_options
 @click.pass_context
 def run(
@@ -296,6 +310,8 @@ def run(
     max_items_per_collection: int | None,
     resume: str | None,
     force_fresh: bool,
+    stale_after_days: float,
+    allow_stale_resume: bool,
     app_private_key_path: str | None,
     app_client_id: str | None,
     token: str | None,
@@ -335,6 +351,8 @@ def run(
                 item_cap=max_items_per_collection,
                 resume=resume,
                 force_fresh=force_fresh,
+                stale_after_days=stale_after_days,
+                allow_stale_resume=allow_stale_resume,
             )
         )
     except KeyboardInterrupt:
@@ -357,6 +375,8 @@ async def _do_run(
     item_cap: int | None = None,
     resume: str | None = None,
     force_fresh: bool = False,
+    stale_after_days: float = 7.0,
+    allow_stale_resume: bool = False,
 ) -> RunResult:
     transport = Transport(provider)
     try:
@@ -372,6 +392,8 @@ async def _do_run(
             item_cap=item_cap,
             resume=resume,
             force_fresh=force_fresh,
+            stale_after_days=stale_after_days,
+            allow_stale_resume=allow_stale_resume,
         )
     finally:
         await transport.aclose()
@@ -382,6 +404,8 @@ def _print_run_result(result: RunResult) -> None:
     manifest = result.manifest
     if result.resumed_from is not None:
         click.echo(f"resuming snapshot: {result.resumed_from}")
+    if result.reclaimed_stale_claim:
+        click.echo("warning: reclaimed a stale run claim left by a terminated process (EC-12)")
     if result.auto_included_datasets:
         click.echo(f"auto-included dependencies: {', '.join(result.auto_included_datasets)}")
     if manifest is not None:
@@ -398,6 +422,13 @@ def _print_run_result(result: RunResult) -> None:
         if manifest.scope_restricted:
             click.echo("warning: installation is scoped to selected repositories, not all")
         click.echo(f"snapshot: {result.snapshot_dir}")
+    elif result.exit_status is ExitStatus.USER_INTERRUPT:
+        # A graceful first interrupt (AC-4.11) is a notice, not a failure —
+        # the snapshot is intact and resumable, not incomplete-by-accident.
+        if result.snapshot_dir is not None:
+            click.echo(f"snapshot (incomplete, resumable): {result.snapshot_dir}")
+        if result.message:
+            click.echo(result.message)
     else:
         if result.snapshot_dir is not None:
             click.echo(f"snapshot (incomplete): {result.snapshot_dir}", err=True)

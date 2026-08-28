@@ -19,3 +19,14 @@ def utc_now_compact() -> str:
     """A filesystem-safe compact UTC timestamp for snapshot directory names
     (AC-1.5), e.g. `20260828T123456Z`."""
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def parse_compact_utc(value: str) -> datetime:
+    """Parses a `utc_now_compact()`-formatted timestamp back into a
+    timezone-aware UTC `datetime` — used by Story 13's staleness check
+    (AC-4.10) to compute a snapshot's age directly from its directory
+    name, rather than a filesystem mtime that could be changed by an
+    unrelated copy or backup operation. Raises `ValueError` if `value`
+    isn't in the expected shape, e.g. a snapshot directory name that
+    doesn't match `utc_now_compact()`'s format at all."""
+    return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)

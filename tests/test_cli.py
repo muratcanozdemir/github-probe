@@ -543,3 +543,102 @@ class TestRunCommandResumeOptions:
         invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
         assert invocation.exit_code == 0
         assert f"resuming snapshot: {resumed}" in invocation.output
+
+
+class TestRunCommandResumeSafetyOptions:
+    def test_stale_after_days_and_allow_stale_resume_are_passed_through_ac_4_10(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main,
+            [
+                "run",
+                "acme",
+                "--token",
+                "ghs_x",
+                "--stale-after-days",
+                "3",
+                "--allow-stale-resume",
+            ],
+        )
+        assert invocation.exit_code == 0
+        assert captured["stale_after_days"] == 3.0
+        assert captured["allow_stale_resume"] is True
+
+    def test_defaults_are_seven_days_and_not_allowed(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert captured["stale_after_days"] == 7.0
+        assert captured["allow_stale_resume"] is False
+
+    def test_reclaimed_stale_claim_prints_a_warning_ec_12(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        result = RunResult(ExitStatus.SUCCESS, None, None, 0.0, reclaimed_stale_claim=True)
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert "reclaimed a stale run claim" in invocation.output
+
+    def test_concurrent_run_refused_exits_with_its_own_status(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        result = RunResult(
+            ExitStatus.CONCURRENT_RUN_REFUSED, None, None, 0.0, message="already running"
+        )
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == ExitStatus.CONCURRENT_RUN_REFUSED
+        assert "already running" in invocation.output
+
+    def test_user_interrupt_result_prints_the_resume_message_without_error_prefix_ac_4_11(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from org_harvest.run import ExitStatus, RunResult
+
+        snap = tmp_path / "acme" / "20260101T000000Z"
+        result = RunResult(
+            ExitStatus.USER_INTERRUPT,
+            snap,
+            None,
+            0.0,
+            message="interrupted; resume with: org-harvest run acme --resume 20260101T000000Z",
+        )
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 130
+        assert "error:" not in invocation.output
+        assert "resume with: org-harvest run acme --resume 20260101T000000Z" in invocation.output

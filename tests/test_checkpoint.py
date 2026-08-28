@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from org_harvest.checkpoint import CHECKPOINT_SCHEMA_VERSION, CheckpointStore
@@ -47,6 +48,39 @@ class TestCheckpointRoundTrip:
         CheckpointStore.create(path, org="acme", dataset_selection=("organization",))
         loaded = CheckpointStore.load(path)
         assert loaded.repository_filter is None
+
+    def test_repository_exclude_flags_round_trip_ac_4_8(self, tmp_path: Path):
+        path = tmp_path / "checkpoint.json"
+        CheckpointStore.create(
+            path,
+            org="acme",
+            dataset_selection=("organization",),
+            repository_exclude_archived=True,
+            repository_exclude_forks=True,
+        )
+        loaded = CheckpointStore.load(path)
+        assert loaded.repository_exclude_archived is True
+        assert loaded.repository_exclude_forks is True
+
+    def test_repository_exclude_flags_default_false(self, tmp_path: Path):
+        path = tmp_path / "checkpoint.json"
+        CheckpointStore.create(path, org="acme", dataset_selection=("organization",))
+        loaded = CheckpointStore.load(path)
+        assert loaded.repository_exclude_archived is False
+        assert loaded.repository_exclude_forks is False
+
+    def test_a_checkpoint_written_before_the_exclude_flags_existed_still_loads(
+        self, tmp_path: Path
+    ):
+        path = tmp_path / "checkpoint.json"
+        CheckpointStore.create(path, org="acme", dataset_selection=("organization",))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        del raw["repository_exclude_archived"]
+        del raw["repository_exclude_forks"]
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        loaded = CheckpointStore.load(path)
+        assert loaded.repository_exclude_archived is False
+        assert loaded.repository_exclude_forks is False
 
 
 class TestCheckpointDurability:

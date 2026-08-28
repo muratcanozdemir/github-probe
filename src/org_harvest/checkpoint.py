@@ -56,6 +56,14 @@ class CheckpointState:
     #: resource (e.g. `team_members:T_kwDOA...`).
     cursors: dict[str, str | None] = field(default_factory=dict)
     gaps: list[dict[str, str | None]] = field(default_factory=list)
+    #: Alongside `repository_filter`'s name allowlist, the two exclusion
+    #: flags a run's `RepositoryFilter` can also carry (Story 13, AC-4.8) —
+    #: recorded so a resume whose filter doesn't match the original run's
+    #: can be refused. Defaulted `False` (matching `RepositoryFilter`'s own
+    #: defaults) so a checkpoint from before this story's addition still
+    #: loads as "no exclusion", not an error.
+    repository_exclude_archived: bool = False
+    repository_exclude_forks: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -66,6 +74,8 @@ class CheckpointState:
             "repository_filter": (
                 list(self.repository_filter) if self.repository_filter is not None else None
             ),
+            "repository_exclude_archived": self.repository_exclude_archived,
+            "repository_exclude_forks": self.repository_exclude_forks,
             "dataset_status": self.dataset_status,
             "cursors": self.cursors,
             "gaps": self.gaps,
@@ -83,6 +93,8 @@ class CheckpointState:
                 if data.get("repository_filter") is not None
                 else None
             ),
+            repository_exclude_archived=bool(data.get("repository_exclude_archived", False)),
+            repository_exclude_forks=bool(data.get("repository_exclude_forks", False)),
             dataset_status=dict(data.get("dataset_status", {})),
             cursors=dict(data.get("cursors", {})),
             gaps=list(data.get("gaps", [])),
@@ -106,6 +118,8 @@ class CheckpointStore:
         org: str,
         dataset_selection: tuple[str, ...],
         repository_filter: tuple[str, ...] | None = None,
+        repository_exclude_archived: bool = False,
+        repository_exclude_forks: bool = False,
     ) -> CheckpointStore:
         state = CheckpointState(
             schema_version=CHECKPOINT_SCHEMA_VERSION,
@@ -113,6 +127,8 @@ class CheckpointStore:
             org=org,
             dataset_selection=dataset_selection,
             repository_filter=repository_filter,
+            repository_exclude_archived=repository_exclude_archived,
+            repository_exclude_forks=repository_exclude_forks,
         )
         store = cls(path, state)
         store.save()

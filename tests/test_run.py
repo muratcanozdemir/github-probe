@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,13 @@ from org_harvest.run import ExitStatus, exit_status_for_error, run_snapshot
 from org_harvest.transport import Transport
 
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
+
+
+def _recent_compact(minutes_ago: int) -> str:
+    """A `utc_now_compact()`-shaped timestamp a few minutes in the past —
+    distinct and orderable for resume-discovery tests, but well inside
+    the default staleness window."""
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _report(blocked: tuple[str, ...] = ()) -> PreflightReport:
@@ -152,7 +160,11 @@ class TestPreflightGating:
         assert result.snapshot_dir is None
         assert "organization" in (result.message or "")
         assert "fetch_org" not in calls
-        assert not (tmp_path / "acme").exists()
+        # The org claim (Story 13, FR-9) needs `tmp_path/acme` to exist to
+        # hold its lock file, so the org directory itself now exists even
+        # on a fail-fast abort — but no timestamped snapshot directory
+        # inside it was ever created.
+        assert not any((tmp_path / "acme").glob("2*"))
         await transport.aclose()
 
     async def test_blocked_without_fail_fast_proceeds_ac_6_4(
@@ -344,7 +356,7 @@ class TestResume:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         org_dir = tmp_path / "acme"
-        existing = org_dir / "20260101T000000Z"
+        existing = org_dir / _recent_compact(5)
         existing.mkdir(parents=True)
         CheckpointStore.create(
             existing / "checkpoint.json", org="acme", dataset_selection=("organization",)
@@ -352,7 +364,11 @@ class TestResume:
         _patch_success(monkeypatch)
         transport = _transport()
         result = await run_snapshot(
-            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
         )
         assert result.resumed_from == existing
         assert result.snapshot_dir == existing
@@ -364,7 +380,7 @@ class TestResume:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         org_dir = tmp_path / "acme"
-        existing = org_dir / "20260101T000000Z"
+        existing = org_dir / _recent_compact(5)
         existing.mkdir(parents=True)
         CheckpointStore.create(
             existing / "checkpoint.json", org="acme", dataset_selection=("organization",)
@@ -388,8 +404,8 @@ class TestResume:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         org_dir = tmp_path / "acme"
-        older = org_dir / "20260101T000000Z"
-        newer = org_dir / "20260102T000000Z"
+        older = org_dir / _recent_compact(10)
+        newer = org_dir / _recent_compact(5)
         for snap in (older, newer):
             snap.mkdir(parents=True)
             CheckpointStore.create(
@@ -402,7 +418,8 @@ class TestResume:
             transport.credentials,
             org="acme",
             snapshot_root=tmp_path,
-            resume="20260101T000000Z",
+            dataset_names=("organization",),
+            resume=older.name,
         )
         assert result.resumed_from == older  # named snapshot wins over the newer one
         await transport.aclose()
@@ -424,4 +441,381 @@ class TestResume:
         assert result.snapshot_dir is None
         assert "does-not-exist" in (result.message or "")
         assert "preflight" not in calls
+        await transport.aclose()
+
+
+class TestResumeSafetyGuards:
+    async def test_org_mismatch_refuses_resume_ac_4_8(self, tmp_path: Path):
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="OTHERORG", dataset_selection=("organization",)
+        )
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "org" in (result.message or "").lower()
+        await transport.aclose()
+
+    async def test_dataset_selection_mismatch_refuses_resume_ac_4_8(self, tmp_path: Path):
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="acme", dataset_selection=("organization", "members")
+        )
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "selection" in (result.message or "").lower()
+        await transport.aclose()
+
+    async def test_repository_filter_mismatch_refuses_resume_ac_4_8(self, tmp_path: Path):
+        from org_harvest.selection import RepositoryFilter
+
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json",
+            org="acme",
+            dataset_selection=("organization",),
+            repository_exclude_archived=True,
+        )
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+            repository_filter=RepositoryFilter(),
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "repository filter" in (result.message or "").lower()
+        await transport.aclose()
+
+    async def test_matching_selection_and_filter_proceeds_to_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.selection import RepositoryFilter
+
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json",
+            org="acme",
+            dataset_selection=("organization",),
+            repository_filter=("repo1",),
+            repository_exclude_archived=True,
+        )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+            repository_filter=RepositoryFilter(names=frozenset({"repo1"}), exclude_archived=True),
+        )
+        assert result.resumed_from == snap
+        await transport.aclose()
+
+    async def test_unreadable_checkpoint_refuses_resume_ac_4_9(self, tmp_path: Path):
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        (snap / "checkpoint.json").write_text("not json at all", encoding="utf-8")
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "--force-fresh" in (result.message or "")
+        await transport.aclose()
+
+    async def test_incompatible_schema_version_refuses_resume_ac_4_9(self, tmp_path: Path):
+        import json
+
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        raw = json.loads((snap / "checkpoint.json").read_text(encoding="utf-8"))
+        raw["schema_version"] = 999
+        (snap / "checkpoint.json").write_text(json.dumps(raw), encoding="utf-8")
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "incompatible" in (result.message or "").lower()
+        await transport.aclose()
+
+    async def test_stale_snapshot_refuses_resume_by_default_ac_4_10(self, tmp_path: Path):
+        org_dir = tmp_path / "acme"
+        old_name = (datetime.now(UTC) - timedelta(days=10)).strftime("%Y%m%dT%H%M%SZ")
+        snap = org_dir / old_name
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert "stale" in (result.message or "").lower() or "days old" in (result.message or "")
+        await transport.aclose()
+
+    async def test_allow_stale_resume_overrides_the_staleness_refusal_ac_4_10(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        org_dir = tmp_path / "acme"
+        old_name = (datetime.now(UTC) - timedelta(days=10)).strftime("%Y%m%dT%H%M%SZ")
+        snap = org_dir / old_name
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+            allow_stale_resume=True,
+        )
+        assert result.resumed_from == snap
+        await transport.aclose()
+
+    async def test_custom_stale_after_days_is_honored_ac_4_10(self, tmp_path: Path):
+        org_dir = tmp_path / "acme"
+        snap = org_dir / _recent_compact(1)  # one minute old
+        snap.mkdir(parents=True)
+        CheckpointStore.create(
+            snap / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            dataset_names=("organization",),
+            stale_after_days=0.0001,  # ~8.6 seconds — one minute is already stale
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        await transport.aclose()
+
+
+class TestConcurrentRun:
+    async def test_a_live_claim_refuses_a_second_run_ec_13(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.lock import OrgClaim
+
+        held = OrgClaim.acquire(tmp_path / "acme")
+        assert isinstance(held, OrgClaim)
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.CONCURRENT_RUN_REFUSED
+        held.release()
+        await transport.aclose()
+
+    async def test_a_different_org_is_not_blocked_by_another_orgs_claim_ec_13(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.lock import OrgClaim
+
+        held = OrgClaim.acquire(tmp_path / "widgets")
+        assert isinstance(held, OrgClaim)
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.SUCCESS
+        held.release()
+        await transport.aclose()
+
+    async def test_a_stale_claim_is_reclaimed_with_a_warning_reported_ec_12(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        org_dir = tmp_path / "acme"
+        org_dir.mkdir(parents=True)
+        (org_dir / ".run.lock").write_text(
+            json.dumps({"pid": 2**30, "claimed_at": "2020-01-01T00:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.SUCCESS
+        assert result.reclaimed_stale_claim is True
+        await transport.aclose()
+
+    async def test_the_claim_is_released_after_a_successful_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.lock import LOCK_FILENAME
+
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.SUCCESS
+        assert not (tmp_path / "acme" / LOCK_FILENAME).exists()
+        await transport.aclose()
+
+    async def test_the_claim_is_released_even_when_a_phase_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.lock import LOCK_FILENAME
+
+        async def fake_preflight(*args, **kwargs):
+            return _report()
+
+        async def fake_fetch_org(*args, **kwargs):
+            raise OrgHarvestError("boom", kind=ErrorKind.REQUEST_FAILED)
+
+        monkeypatch.setattr("org_harvest.run.run_preflight", fake_preflight)
+        monkeypatch.setattr("org_harvest.run.fetch_organization_directory", fake_fetch_org)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.UNEXPECTED_FAILURE
+        assert not (tmp_path / "acme" / LOCK_FILENAME).exists()
+        await transport.aclose()
+
+
+class TestInterruptOrchestration:
+    async def test_a_cooperative_interrupt_during_phase_1_stops_before_phase_2_ac_4_11(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls: dict[str, int] = {}
+
+        async def fake_preflight(*args, **kwargs):
+            return _report()
+
+        async def fake_fetch_org(*args, **kwargs):
+            calls["fetch_org"] = calls.get("fetch_org", 0) + 1
+            kwargs["interrupt"].requested = True
+            return _org_result()
+
+        async def fake_fetch_repo(*args, **kwargs):
+            calls["fetch_repo"] = calls.get("fetch_repo", 0) + 1
+            return _repo_result()
+
+        def fake_finalize(*args, **kwargs):
+            calls["finalize"] = calls.get("finalize", 0) + 1
+            return FinalizeResult(())
+
+        monkeypatch.setattr("org_harvest.run.run_preflight", fake_preflight)
+        monkeypatch.setattr("org_harvest.run.fetch_organization_directory", fake_fetch_org)
+        monkeypatch.setattr("org_harvest.run.fetch_repository_datasets", fake_fetch_repo)
+        monkeypatch.setattr("org_harvest.run.finalize_snapshot", fake_finalize)
+
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.USER_INTERRUPT
+        assert result.manifest is None
+        assert "fetch_repo" not in calls
+        assert "finalize" not in calls
+        assert result.snapshot_dir is not None
+        assert "--resume" in (result.message or "")
+        assert not (result.snapshot_dir / "manifest.json").exists()
+        await transport.aclose()
+
+    async def test_an_interrupt_during_phase_2_also_skips_finalize(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls: dict[str, int] = {}
+
+        async def fake_preflight(*args, **kwargs):
+            return _report()
+
+        async def fake_fetch_org(*args, **kwargs):
+            return _org_result()
+
+        async def fake_fetch_repo(*args, **kwargs):
+            kwargs["interrupt"].requested = True
+            return _repo_result()
+
+        def fake_finalize(*args, **kwargs):
+            calls["finalize"] = calls.get("finalize", 0) + 1
+            return FinalizeResult(())
+
+        monkeypatch.setattr("org_harvest.run.run_preflight", fake_preflight)
+        monkeypatch.setattr("org_harvest.run.fetch_organization_directory", fake_fetch_org)
+        monkeypatch.setattr("org_harvest.run.fetch_repository_datasets", fake_fetch_repo)
+        monkeypatch.setattr("org_harvest.run.finalize_snapshot", fake_finalize)
+
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.USER_INTERRUPT
+        assert result.manifest is None
+        assert "finalize" not in calls
+        await transport.aclose()
+
+    async def test_the_claim_is_released_after_a_cooperative_interrupt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.lock import LOCK_FILENAME
+
+        async def fake_preflight(*args, **kwargs):
+            return _report()
+
+        async def fake_fetch_org(*args, **kwargs):
+            kwargs["interrupt"].requested = True
+            return _org_result()
+
+        monkeypatch.setattr("org_harvest.run.run_preflight", fake_preflight)
+        monkeypatch.setattr("org_harvest.run.fetch_organization_directory", fake_fetch_org)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.exit_status is ExitStatus.USER_INTERRUPT
+        assert not (tmp_path / "acme" / LOCK_FILENAME).exists()
         await transport.aclose()

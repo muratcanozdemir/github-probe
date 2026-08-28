@@ -442,6 +442,7 @@ class TestPagination:
             # rest of the full-directory fetch for this pagination-focused test.
             from org_harvest.checkpoint import CheckpointStore
             from org_harvest.harvest.org_level import _ORG_CONNECTIONS, _OrgLevelHarvester
+            from org_harvest.interrupt import InterruptGuard
             from org_harvest.selection import RepositoryFilter
 
             checkpoint = CheckpointStore.create(
@@ -456,6 +457,7 @@ class TestPagination:
                 page_size=1,
                 systemic_guard=SystemicFailureGuard(),
                 repository_filter=RepositoryFilter(),
+                interrupt=InterruptGuard(),
             )
             spec = next(s for s in _ORG_CONNECTIONS if s.dataset == "members")
             outcome = await harvester.fetch_org_connection(spec)
@@ -1004,4 +1006,96 @@ class TestResume:
                 checkpoint=checkpoint,
             )
         assert queried_slugs == ["infra"]  # T_1 (core) skipped as already done
+        await transport.aclose()
+
+
+class TestInterrupt:
+    async def test_a_requested_interrupt_stops_pagination_after_the_in_flight_page_ac_4_11(
+        self, tmp_path: Path
+    ):
+        from org_harvest.harvest.org_level import _ORG_CONNECTIONS, _OrgLevelHarvester
+        from org_harvest.hosts import ApiHost
+        from org_harvest.interrupt import InterruptGuard
+
+        interrupt = InterruptGuard()
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            cursor = body["variables"]["cursor"]
+            calls["n"] += 1
+            if cursor is None:
+                page = {
+                    "pageInfo": _page_info(True, "CURSOR_1"),
+                    "edges": [{"role": "MEMBER", "node": {"id": "U_1", "login": "alice"}}],
+                }
+                interrupt.requested = True  # simulate Ctrl-C arriving mid-page
+            else:
+                page = {
+                    "pageInfo": _page_info(False, None),
+                    "edges": [{"role": "MEMBER", "node": {"id": "U_2", "login": "bob"}}],
+                }
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"rateLimit": _rate_limit(), "organization": {"membersWithRole": page}}
+                },
+            )
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("members",)
+        )
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            harvester = _OrgLevelHarvester(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                api_host=ApiHost(),
+                checkpoint=checkpoint,
+                page_size=1,
+                systemic_guard=SystemicFailureGuard(),
+                repository_filter=RepositoryFilter(),
+                interrupt=interrupt,
+            )
+            spec = next(s for s in _ORG_CONNECTIONS if s.dataset == "members")
+            outcome = await harvester.fetch_org_connection(spec)
+        assert calls["n"] == 1  # the second page was never requested
+        assert outcome.record_count == 1
+        state = CheckpointStore.load(snapshot_dir / "checkpoint.json")
+        assert state.cursors["members"] == "CURSOR_1"  # real cursor, resumable
+        assert state.dataset_status.get("members") != "complete"
+        await transport.aclose()
+
+    async def test_an_interrupt_stops_the_outer_dataset_loop_too(self, tmp_path: Path):
+        from org_harvest.interrupt import InterruptGuard
+
+        interrupt = InterruptGuard()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = json.loads(request.content)["query"]
+            if "membersWithRole(" in query:
+                interrupt.requested = True
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "members", "pending_members"),
+                interrupt=interrupt,
+            )
+        names = {o.name for o in result.dataset_outcomes}
+        assert "organization" in names  # ran before the interrupt was set
+        assert "members" in names  # the in-flight dataset still finishes its call
+        assert "pending_members" not in names  # never started once interrupted
         await transport.aclose()

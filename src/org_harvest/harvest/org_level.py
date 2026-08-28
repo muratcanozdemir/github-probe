@@ -43,6 +43,7 @@ from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
+from org_harvest.interrupt import InterruptGuard
 from org_harvest.output import NdjsonWriter, count_records
 from org_harvest.selection import RepositoryFilter
 from org_harvest.transport import Transport
@@ -265,6 +266,7 @@ class _OrgLevelHarvester:
         page_size: int,
         systemic_guard: SystemicFailureGuard,
         repository_filter: RepositoryFilter,
+        interrupt: InterruptGuard,
     ) -> None:
         self._transport = transport
         self._org = org
@@ -274,6 +276,14 @@ class _OrgLevelHarvester:
         self._page_size = page_size
         self._systemic_guard = systemic_guard
         self._repository_filter = repository_filter
+        self._interrupt = interrupt
+
+    @property
+    def interrupted(self) -> bool:
+        """Story 13, AC-4.11: `True` once the user has asked (once) to stop
+        — checked between pages and between datasets so the current page
+        finishes and its checkpoint write lands before anything stops."""
+        return self._interrupt.requested
 
     def _writer(self, dataset: str) -> NdjsonWriter:
         return NdjsonWriter(self._snapshot_dir / f"{dataset}.ndjson")
@@ -432,9 +442,10 @@ class _OrgLevelHarvester:
                 page_info = connection["pageInfo"]
                 cursor = page_info["endCursor"]
                 self._checkpoint.set_cursor(spec.dataset, cursor)
-                if not page_info["hasNextPage"]:
+                if not page_info["hasNextPage"] or self.interrupted:
                     break
-        self._checkpoint.set_dataset_status(spec.dataset, "complete")
+        if not self.interrupted:
+            self._checkpoint.set_dataset_status(spec.dataset, "complete")
         path = self._snapshot_dir / f"{spec.dataset}.ndjson"
         return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
 
@@ -447,6 +458,8 @@ class _OrgLevelHarvester:
         selection = f"edges {{ {spec.edge_field} node {{ {spec.node_selection} }} }}"
         with self._writer(spec.dataset) as writer:
             for team in teams:
+                if self.interrupted:
+                    break
                 team_id = team["id"]
                 team_slug = team["slug"]
                 cursor_key = f"{spec.dataset}:{team_id}"
@@ -504,10 +517,13 @@ class _OrgLevelHarvester:
                     if page_info["hasNextPage"]:
                         cursor = page_info["endCursor"]
                         self._checkpoint.set_cursor(cursor_key, cursor)
+                        if self.interrupted:
+                            break
                     else:
                         self._checkpoint.set_cursor(cursor_key, CURSOR_DONE)
                         break
-        self._checkpoint.set_dataset_status(spec.dataset, "complete")
+        if not self.interrupted:
+            self._checkpoint.set_dataset_status(spec.dataset, "complete")
         path = self._snapshot_dir / f"{spec.dataset}.ndjson"
         return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
 
@@ -531,6 +547,7 @@ async def fetch_organization_directory(
     systemic_guard: SystemicFailureGuard | None = None,
     dataset_names: Sequence[str] | None = None,
     repository_filter: RepositoryFilter | None = None,
+    interrupt: InterruptGuard | None = None,
 ) -> OrgLevelResult:
     """Fetches organization-level datasets (AC-1.2) and writes each to
     `snapshot_dir` as NDJSON. `dataset_names` narrows or expands the
@@ -573,15 +590,18 @@ async def fetch_organization_directory(
         page_size=page_size,
         systemic_guard=systemic_guard or SystemicFailureGuard(),
         repository_filter=repository_filter or RepositoryFilter(),
+        interrupt=interrupt or InterruptGuard(),
     )
 
     outcomes: list[DatasetOutcome] = []
-    if selected is None or "organization" in selected:
+    if (selected is None or "organization" in selected) and not harvester.interrupted:
         outcomes.append(await harvester.fetch_organization_scalar())
 
     connections_by_name = {spec.dataset: spec for spec in _ORG_CONNECTIONS}
     reachable_repository_count = 0
     for name in ("members", "pending_members", "teams", "repositories"):
+        if harvester.interrupted:
+            break
         if selected is not None and name not in selected:
             continue
         outcome = await harvester.fetch_org_connection(connections_by_name[name])
@@ -589,13 +609,15 @@ async def fetch_organization_directory(
         if name == "repositories":
             reachable_repository_count = outcome.record_count
     for name in ("org_rulesets", "org_custom_properties", "org_domains", "org_ip_allow_list"):
+        if harvester.interrupted:
+            break
         if selected is None or name in selected:
             outcomes.append(await harvester.fetch_org_connection(connections_by_name[name]))
 
     team_connections_by_name = {spec.dataset: spec for spec in _TEAM_CONNECTIONS}
     needs_team_members = selected is None or "team_members" in selected
     needs_team_repositories = selected is None or "team_repositories" in selected
-    if needs_team_members or needs_team_repositories:
+    if not harvester.interrupted and (needs_team_members or needs_team_repositories):
         teams = _read_ndjson(snapshot_dir / "teams.ndjson")
         if needs_team_members:
             outcomes.append(
@@ -603,14 +625,14 @@ async def fetch_organization_directory(
                     team_connections_by_name["team_members"], teams
                 )
             )
-        if needs_team_repositories:
+        if needs_team_repositories and not harvester.interrupted:
             outcomes.append(
                 await harvester.fetch_team_connection(
                     team_connections_by_name["team_repositories"], teams
                 )
             )
 
-    if selected is not None:
+    if selected is not None and not harvester.interrupted:
         implemented = {"organization", *connections_by_name, *team_connections_by_name}
         for name in sorted(selected - implemented):
             if get(name).level is not DatasetLevel.ORGANIZATION:

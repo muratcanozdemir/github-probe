@@ -21,6 +21,7 @@ from org_harvest.harvest.repo_level import (
 )
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
+from org_harvest.interrupt import InterruptGuard
 from org_harvest.transport import Transport
 
 GITHUB = "https://api.github.com"
@@ -368,6 +369,7 @@ class TestNodeLimitRetry:
             batch_width=10,
             systemic_guard=SystemicFailureGuard(),
             item_cap=None,
+            interrupt=InterruptGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
@@ -415,6 +417,7 @@ class TestNodeLimitRetry:
             batch_width=2,
             systemic_guard=SystemicFailureGuard(),
             item_cap=None,
+            interrupt=InterruptGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         batch = [_RepoState(id="R_1", name="repo1"), _RepoState(id="R_2", name="repo2")]
@@ -455,6 +458,7 @@ class TestNodeLimitRetry:
             batch_width=1,
             systemic_guard=SystemicFailureGuard(),
             item_cap=None,
+            interrupt=InterruptGuard(),
         )
         spec = next(s for s in _REPO_CONNECTIONS if s.dataset == "issues")
         with respx.mock(base_url=GITHUB) as router:
@@ -835,4 +839,75 @@ class TestResume:
             )
         assert calls["n"] == 0
         assert result.dataset_outcomes[0].record_count == 1
+        await transport.aclose()
+
+
+class TestInterrupt:
+    async def test_a_requested_interrupt_stops_after_the_in_flight_batch_ac_4_11(
+        self, tmp_path: Path
+    ):
+        from org_harvest.interrupt import InterruptGuard
+
+        interrupt = InterruptGuard()
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        pages = {
+            None: {"has_next": True, "cursor": "C1", "nodes": [_issue_node(1), _issue_node(2)]},
+            "C1": {"has_next": False, "cursor": None, "nodes": [_issue_node(3)]},
+        }
+        base_handler = _multi_page_issues_handler(pages)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "issues(" in body["query"] and body["variables"].get("repo0_cursor") is None:
+                interrupt.requested = True  # simulate Ctrl-C arriving mid-page
+            return base_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues",),
+                interrupt=interrupt,
+            )
+        outcome = result.dataset_outcomes[0]
+        assert outcome.record_count == 2  # only the in-flight page's records
+        issues = _read_lines(snapshot_dir / "issues.ndjson")
+        assert [i["id"] for i in issues] == ["I_1", "I_2"]
+        state = CheckpointStore.load(snapshot_dir / "checkpoint.json")
+        assert state.cursors["issues:R_1"] == "C1"  # real cursor, resumable
+        assert state.dataset_status.get("issues") != "complete"
+        await transport.aclose()
+
+    async def test_an_interrupt_stops_the_outer_dataset_loop_too(self, tmp_path: Path):
+        from org_harvest.interrupt import InterruptGuard
+
+        interrupt = InterruptGuard()
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = json.loads(request.content)["query"]
+            if "labels(" in query:
+                interrupt.requested = True
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("labels", "milestones"),
+                interrupt=interrupt,
+            )
+        names = {o.name for o in result.dataset_outcomes}
+        assert "labels" in names  # the in-flight dataset still finishes its call
+        assert "milestones" not in names  # never started once interrupted
         await transport.aclose()
