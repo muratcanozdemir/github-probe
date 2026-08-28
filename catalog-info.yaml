@@ -1,0 +1,14 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: github-probe
+  title: github-probe (org-harvest)
+  description: org-harvest downloads a complete, self-consistent snapshot of a GitHub organization via the GraphQL API, authenticating as a GitHub App installation, writing NDJSON/Parquet plus a run manifest.
+  tags: [python, cli, github, graphql]
+  annotations:
+    github.com/project-slug: muratcanozdemir/github-probe
+    backstage.io/techdocs-ref: dir:.
+spec:
+  type: tool
+  owner: user:default/muratcanozdemir
+  lifecycle: experimental
