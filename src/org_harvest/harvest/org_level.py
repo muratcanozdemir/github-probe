@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from org_harvest.checkpoint import CheckpointStore
+from org_harvest.checkpoint import CURSOR_DONE, CheckpointStore
 from org_harvest.credentials import CredentialProvider
 from org_harvest.datasets import DatasetLevel, complete_fetch_details, get
 from org_harvest.errors import ErrorKind, OrgHarvestError
@@ -43,7 +43,7 @@ from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
-from org_harvest.output import NdjsonWriter
+from org_harvest.output import NdjsonWriter, count_records
 from org_harvest.selection import RepositoryFilter
 from org_harvest.transport import Transport
 
@@ -325,7 +325,26 @@ class _OrgLevelHarvester:
         self._checkpoint.record_gap(gap)
         return gap
 
+    def _is_already_complete(self, dataset: str) -> bool:
+        return self._checkpoint.state.dataset_status.get(dataset) == "complete"
+
+    def _resumed_outcome(self, dataset: str) -> DatasetOutcome:
+        """AC-4.2/AC-4.5: this dataset was already marked complete by a
+        prior attempt on this same checkpoint — skip re-fetching it
+        entirely rather than issuing a wasted "no more pages" request.
+        The record count comes from the NDJSON file itself (ground truth,
+        tolerant of a truncated trailing line — AC-4.6); gaps come from
+        whatever this dataset already recorded to the checkpoint's gap
+        ledger, so a resumed run's manifest still reflects that history."""
+        path = self._snapshot_dir / f"{dataset}.ndjson"
+        gaps = tuple(
+            Gap.from_dict(g) for g in self._checkpoint.state.gaps if g.get("dataset") == dataset
+        )
+        return DatasetOutcome(dataset, count_records(path), gaps)
+
     async def fetch_organization_scalar(self) -> DatasetOutcome:
+        if self._is_already_complete("organization"):
+            return self._resumed_outcome("organization")
         query = f"""
         query($org: String!) {{
           rateLimit {{ limit remaining resetAt cost nodeCount }}
@@ -334,7 +353,6 @@ class _OrgLevelHarvester:
         """
         data, errors, transport_failure = await self._query(query, {"org": self._org})
         gaps: list[Gap] = []
-        count = 0
         with self._writer("organization") as writer:
             if transport_failure is not None:
                 gaps.append(self._record_missing("organization", self._org, transport_failure))
@@ -343,7 +361,6 @@ class _OrgLevelHarvester:
                 org_data = data.get("organization") if data else None
                 if org_data is not None:
                     writer.write_record(flatten_node(org_data, edge_field=None, edge_value=None))
-                    count = 1
                 elif not errors:
                     gaps.append(
                         self._record_missing(
@@ -351,11 +368,13 @@ class _OrgLevelHarvester:
                         )
                     )
         self._checkpoint.set_dataset_status("organization", "complete")
-        return DatasetOutcome("organization", count, tuple(gaps))
+        path = self._snapshot_dir / "organization.ndjson"
+        return DatasetOutcome("organization", count_records(path), tuple(gaps))
 
     async def fetch_org_connection(self, spec: _ConnectionSpec) -> DatasetOutcome:
+        if self._is_already_complete(spec.dataset):
+            return self._resumed_outcome(spec.dataset)
         cursor = self._checkpoint.state.cursors.get(spec.dataset)
-        count = 0
         gaps: list[Gap] = []
         selection = (
             f"edges {{ {spec.edge_field} node {{ {spec.node_selection} }} }}"
@@ -410,19 +429,20 @@ class _OrgLevelHarvester:
                     ):
                         continue
                     writer.write_record(record)
-                    count += 1
                 page_info = connection["pageInfo"]
                 cursor = page_info["endCursor"]
                 self._checkpoint.set_cursor(spec.dataset, cursor)
                 if not page_info["hasNextPage"]:
                     break
         self._checkpoint.set_dataset_status(spec.dataset, "complete")
-        return DatasetOutcome(spec.dataset, count, tuple(gaps))
+        path = self._snapshot_dir / f"{spec.dataset}.ndjson"
+        return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
 
     async def fetch_team_connection(
         self, spec: _ConnectionSpec, teams: list[dict[str, Any]]
     ) -> DatasetOutcome:
-        count = 0
+        if self._is_already_complete(spec.dataset):
+            return self._resumed_outcome(spec.dataset)
         gaps: list[Gap] = []
         selection = f"edges {{ {spec.edge_field} node {{ {spec.node_selection} }} }}"
         with self._writer(spec.dataset) as writer:
@@ -431,6 +451,8 @@ class _OrgLevelHarvester:
                 team_slug = team["slug"]
                 cursor_key = f"{spec.dataset}:{team_id}"
                 cursor = self._checkpoint.state.cursors.get(cursor_key)
+                if cursor == CURSOR_DONE:
+                    continue  # already fully fetched for this team in a prior attempt
                 while True:
                     query = f"""
                     query($org: String!, $slug: String!, $cursor: String, $pageSize: Int!) {{
@@ -469,6 +491,7 @@ class _OrgLevelHarvester:
                                     spec.dataset, team_id, "no data returned for this team"
                                 )
                             )
+                        self._checkpoint.set_cursor(cursor_key, CURSOR_DONE)
                         break
                     for item in connection["edges"]:
                         node = item["node"]
@@ -477,14 +500,16 @@ class _OrgLevelHarvester:
                         )
                         record["team_id"] = team_id
                         writer.write_record(record)
-                        count += 1
                     page_info = connection["pageInfo"]
-                    cursor = page_info["endCursor"]
-                    self._checkpoint.set_cursor(cursor_key, cursor)
-                    if not page_info["hasNextPage"]:
+                    if page_info["hasNextPage"]:
+                        cursor = page_info["endCursor"]
+                        self._checkpoint.set_cursor(cursor_key, cursor)
+                    else:
+                        self._checkpoint.set_cursor(cursor_key, CURSOR_DONE)
                         break
         self._checkpoint.set_dataset_status(spec.dataset, "complete")
-        return DatasetOutcome(spec.dataset, count, tuple(gaps))
+        path = self._snapshot_dir / f"{spec.dataset}.ndjson"
+        return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
 
 
 def _read_ndjson(path: Path) -> list[dict[str, Any]]:

@@ -96,13 +96,27 @@ class TestFinalizeDataset:
 
     def test_conversion_failure_is_a_gap_and_leaves_ndjson_untouched_ac_8_4(self, tmp_path: Path):
         ndjson_path = tmp_path / "organization.ndjson"
-        # A malformed line breaks JSON parsing, forcing a conversion failure.
-        ndjson_path.write_text('{"id": "O_1"\n', encoding="utf-8")
+        # A malformed *non-trailing* line breaks JSON parsing, forcing a
+        # conversion failure — a malformed *trailing* line is Story 12's
+        # AC-4.6 case (an abrupt kill mid-write) and is silently discarded
+        # instead; see TestFinalizeDataset's AC-4.6 test below.
+        ndjson_path.write_text('{not valid json\n{"id": "O_2"}\n', encoding="utf-8")
         outcome = finalize_dataset(tmp_path, "organization")
         assert len(outcome.gaps) == 1
         assert "conversion failed" in outcome.gaps[0].reason.lower()
         assert not (tmp_path / "organization.parquet").exists()
         assert ndjson_path.exists()  # never discarded
+
+    def test_a_truncated_trailing_line_is_discarded_not_a_conversion_failure_ac_4_6(
+        self, tmp_path: Path
+    ):
+        ndjson_path = tmp_path / "organization.ndjson"
+        # Two complete records followed by a truncated third — the
+        # signature of a process killed mid-write (AC-4.6).
+        ndjson_path.write_text('{"id": "O_1"}\n{"id": "O_2"}\n{"id": "O_3", "log', encoding="utf-8")
+        outcome = finalize_dataset(tmp_path, "organization")
+        assert outcome.gaps == ()
+        assert outcome.record_count == 2
 
     def test_unknown_dataset_is_a_gap_not_a_crash(self, tmp_path: Path):
         _write_ndjson(tmp_path / "not_a_real_dataset.ndjson", [{"id": "1"}])
@@ -145,7 +159,7 @@ class TestFinalizeSnapshot:
         assert not result.has_gaps
 
     def test_a_conversion_failure_in_one_dataset_does_not_block_others(self, tmp_path: Path):
-        (tmp_path / "organization.ndjson").write_text("{broken", encoding="utf-8")
+        (tmp_path / "organization.ndjson").write_text('{broken\n{"id": "O_2"}\n', encoding="utf-8")
         _write_ndjson(tmp_path / "issues.ndjson", [{"id": "I_1"}])
         result = finalize_snapshot(tmp_path)
         by_name = {o.name: o for o in result.dataset_outcomes}

@@ -11,6 +11,7 @@ import respx
 from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import StaticTokenCredentialProvider
 from org_harvest.errors import ErrorKind, OrgHarvestError
+from org_harvest.gaps import Gap
 from org_harvest.harvest.org_level import (
     ORG_LEVEL_DATASET_NAMES,
     fetch_organization_directory,
@@ -826,4 +827,181 @@ class TestRepositoryFilter:
             )
         repos = _read_lines(snapshot_dir / "repositories.ndjson")
         assert len(repos) == 3
+        await transport.aclose()
+
+
+class TestResume:
+    async def test_a_complete_dataset_is_not_refetched_ac_4_2_ac_4_5(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "organization.ndjson").write_text(
+            json.dumps({"id": "O_1", "login": "acme"}) + "\n", encoding="utf-8"
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        checkpoint.set_dataset_status("organization", "complete")
+
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB, assert_all_called=False) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization",),
+                checkpoint=checkpoint,
+            )
+        assert calls["n"] == 0  # no network call at all for the already-complete dataset
+        outcome = result.dataset_outcomes[0]
+        assert outcome.name == "organization"
+        assert outcome.record_count == 1
+        await transport.aclose()
+
+    async def test_a_completed_datasets_prior_gaps_still_surface_on_resume(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir(parents=True)
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        checkpoint.record_gap(
+            Gap.now("organization", resource_id="acme", field_path=None, reason="boom")
+        )
+        checkpoint.set_dataset_status("organization", "complete")
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB):
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization",),
+                checkpoint=checkpoint,
+            )
+        outcome = result.dataset_outcomes[0]
+        assert len(outcome.gaps) == 1
+        assert outcome.gaps[0].reason == "boom"
+        await transport.aclose()
+
+    async def test_resumes_a_connection_from_its_stored_cursor_without_duplicating_ac_4_5(
+        self, tmp_path: Path
+    ):
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir(parents=True)
+        # Page 1 was already written and checkpointed by a prior attempt.
+        (snapshot_dir / "members.ndjson").write_text(
+            json.dumps(
+                {
+                    "id": "U_1",
+                    "database_id": 1,
+                    "login": "alice",
+                    "name": "Alice",
+                    "email": "a@x.com",
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "role": "ADMIN",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("members",)
+        )
+        checkpoint.set_cursor("members", "CURSOR_1")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "membersWithRole(" in body["query"]:
+                assert body["variables"]["cursor"] == "CURSOR_1"
+                page = {
+                    "pageInfo": _page_info(False, None),
+                    "edges": [
+                        {
+                            "role": "MEMBER",
+                            "node": {
+                                "id": "U_2",
+                                "databaseId": 2,
+                                "login": "bob",
+                                "name": "Bob",
+                                "email": "b@x.com",
+                                "createdAt": "2020-01-02T00:00:00Z",
+                            },
+                        }
+                    ],
+                }
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "rateLimit": _rate_limit(),
+                            "organization": {"membersWithRole": page},
+                        }
+                    },
+                )
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("members",),
+                checkpoint=checkpoint,
+            )
+        members = _read_lines(snapshot_dir / "members.ndjson")
+        assert [m["id"] for m in members] == ["U_1", "U_2"]
+        await transport.aclose()
+
+    async def test_a_done_team_is_skipped_while_another_team_resumes_ac_4_5(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir(parents=True)
+        snapshot_dir_teams = snapshot_dir / "teams.ndjson"
+        snapshot_dir_teams.write_text(
+            json.dumps({"id": "T_1", "slug": "core"})
+            + "\n"
+            + json.dumps({"id": "T_2", "slug": "infra"})
+            + "\n",
+            encoding="utf-8",
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("team_members",)
+        )
+        checkpoint.set_dataset_status("teams", "complete")
+        checkpoint.set_cursor("team_members:T_1", "__done__")
+
+        queried_slugs: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "team(slug:" in body["query"] and "members(" in body["query"]:
+                queried_slugs.append(body["variables"]["slug"])
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("team_members",),
+                checkpoint=checkpoint,
+            )
+        assert queried_slugs == ["infra"]  # T_1 (core) skipped as already done
         await transport.aclose()

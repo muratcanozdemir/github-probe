@@ -476,3 +476,70 @@ class TestPreflightAutoIncludedReporting:
         assert result.exit_code == 0
         assert "auto-included dependencies:" in result.output
         assert "teams" in result.output
+
+
+class TestRunCommandResumeOptions:
+    def test_resume_option_is_passed_through_ac_4_3(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--resume", "20260101T000000Z"]
+        )
+        assert invocation.exit_code == 0
+        assert captured["resume"] == "20260101T000000Z"
+        assert captured["force_fresh"] is False
+
+    def test_force_fresh_flag_is_passed_through_ac_4_7(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x", "--force-fresh"])
+        assert invocation.exit_code == 0
+        assert captured["resume"] is None
+        assert captured["force_fresh"] is True
+
+    def test_neither_flag_given_passes_none_and_false(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast, **kwargs):
+            captured.update(kwargs)
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert captured["resume"] is None
+        assert captured["force_fresh"] is False
+
+    def test_resumed_from_is_reported_in_output_ac_4_2(self, tmp_path: Path, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        resumed = tmp_path / "acme" / "20260101T000000Z"
+        result = RunResult(ExitStatus.SUCCESS, None, None, 0.0, resumed_from=resumed)
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert f"resuming snapshot: {resumed}" in invocation.output

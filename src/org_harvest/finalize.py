@@ -12,6 +12,12 @@ failure for one dataset is recorded as a gap and never touches that
 dataset's (or any other dataset's) already-downloaded NDJSON (AC-8.4):
 the source file is only ever removed *after* its Parquet file has been
 written successfully.
+
+Reads NDJSON via `output.read_ndjson_tolerant()`, which discards a
+truncated trailing line rather than failing the whole dataset's
+conversion (AC-4.6) — the same tolerance a resumed run's own record
+counts rely on, so a run killed mid-page still finalizes cleanly, minus
+the one record that was in flight.
 """
 
 from __future__ import annotations
@@ -25,14 +31,8 @@ import pyarrow.parquet as pq
 
 from org_harvest.datasets import get
 from org_harvest.gaps import DatasetOutcome, Gap
+from org_harvest.output import read_ndjson_tolerant
 from org_harvest.parquet_schema import NESTED_FIELDS, dataset_schema
-
-
-def _read_ndjson(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
 
 
 def _column_values(records: list[dict[str, Any]], field: str) -> list[Any]:
@@ -57,7 +57,7 @@ def finalize_dataset(
         spec = get(dataset)
         if spec.fields is None:
             raise ValueError(f"dataset '{dataset}' has no declared field list to convert against")
-        records = _read_ndjson(ndjson_path)
+        records = read_ndjson_tolerant(ndjson_path)
         schema = dataset_schema(spec.fields)
         arrays = [
             pa.array(_column_values(records, name), type=schema.field(name).type)

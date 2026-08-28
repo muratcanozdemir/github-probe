@@ -33,6 +33,15 @@ CHECKPOINT_FILENAME = "checkpoint.json"
 #: to implement AC-4.9's "incompatible tool version" refusal.
 CHECKPOINT_SCHEMA_VERSION = 1
 
+#: Stored as a cursor value (Story 12, AC-4.5) to mark one sub-resource
+#: (a repository within a repo-level dataset, a team within a per-team
+#: org-level connection) as fully attempted — paginated to its natural
+#: end, or ended in a recorded gap — so a resumed run skips re-fetching
+#: it entirely rather than re-requesting an empty final page. Distinct
+#: from `None` (never attempted) and from a real opaque GraphQL cursor
+#: (still in progress).
+CURSOR_DONE = "__done__"
+
 
 @dataclass
 class CheckpointState:
@@ -113,6 +122,17 @@ class CheckpointStore:
     def load(cls, path: Path) -> CheckpointState:
         with path.open(encoding="utf-8") as f:
             return CheckpointState.from_json(json.load(f))
+
+    @classmethod
+    def resume(cls, path: Path) -> CheckpointStore:
+        """Opens an existing checkpoint for a resumed run (Story 12,
+        AC-4.2/AC-4.3) — unlike `create()`, this reads whatever state is
+        already on disk (dataset statuses, cursors, gaps) rather than
+        starting fresh, so the harvest engines' own "skip what's already
+        complete, continue from the stored cursor otherwise" logic has
+        real history to act on. Compatibility checks (schema version, org,
+        selection match) are Story 13's job, not this constructor's."""
+        return cls(path, cls.load(path))
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

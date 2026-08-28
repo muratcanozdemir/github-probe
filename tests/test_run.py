@@ -7,6 +7,7 @@ import httpx
 import pytest
 import respx
 
+from org_harvest.checkpoint import CheckpointStore
 from org_harvest.credentials import StaticTokenCredentialProvider
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.finalize import FinalizeResult
@@ -324,4 +325,103 @@ class TestConsumptionStats:
         assert c.graphql_requests == 2
         assert c.rest_requests_consumed == 1
         assert c.rate_limit_waits == 0
+        await transport.aclose()
+
+
+class TestResume:
+    async def test_no_incomplete_snapshot_means_a_fresh_run_resumed_from_is_none_ac_4_4(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.resumed_from is None
+        await transport.aclose()
+
+    async def test_default_resumes_the_newest_incomplete_snapshot_ac_4_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        org_dir = tmp_path / "acme"
+        existing = org_dir / "20260101T000000Z"
+        existing.mkdir(parents=True)
+        CheckpointStore.create(
+            existing / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport, transport.credentials, org="acme", snapshot_root=tmp_path
+        )
+        assert result.resumed_from == existing
+        assert result.snapshot_dir == existing
+        subdirs = [p for p in org_dir.iterdir() if p.is_dir()]
+        assert subdirs == [existing]  # no second snapshot dir was created
+        await transport.aclose()
+
+    async def test_force_fresh_ignores_an_existing_incomplete_snapshot_ac_4_7(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        org_dir = tmp_path / "acme"
+        existing = org_dir / "20260101T000000Z"
+        existing.mkdir(parents=True)
+        CheckpointStore.create(
+            existing / "checkpoint.json", org="acme", dataset_selection=("organization",)
+        )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            force_fresh=True,
+        )
+        assert result.resumed_from is None
+        assert result.snapshot_dir != existing
+        subdirs = [p for p in org_dir.iterdir() if p.is_dir()]
+        assert len(subdirs) == 2  # the old one, plus a fresh one
+        await transport.aclose()
+
+    async def test_resume_by_name_targets_that_exact_snapshot_ac_4_3(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        org_dir = tmp_path / "acme"
+        older = org_dir / "20260101T000000Z"
+        newer = org_dir / "20260102T000000Z"
+        for snap in (older, newer):
+            snap.mkdir(parents=True)
+            CheckpointStore.create(
+                snap / "checkpoint.json", org="acme", dataset_selection=("organization",)
+            )
+        _patch_success(monkeypatch)
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            resume="20260101T000000Z",
+        )
+        assert result.resumed_from == older  # named snapshot wins over the newer one
+        await transport.aclose()
+
+    async def test_resume_by_unknown_name_is_invalid_usage_no_network_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls: dict[str, int] = {}
+        _patch_success(monkeypatch, calls=calls)
+        transport = _transport()
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            resume="does-not-exist",
+        )
+        assert result.exit_status is ExitStatus.INVALID_USAGE
+        assert result.snapshot_dir is None
+        assert "does-not-exist" in (result.message or "")
+        assert "preflight" not in calls
         await transport.aclose()

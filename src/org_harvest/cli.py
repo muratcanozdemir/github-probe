@@ -268,6 +268,20 @@ def _print_preflight_report(report: PreflightReport) -> None:
     default=None,
     help="Cap the number of items collected per repository-level collection (AC-2.9).",
 )
+@click.option(
+    "--resume",
+    default=None,
+    metavar="SNAPSHOT",
+    help="Resume a specific snapshot by name (its timestamp directory) instead of "
+    "the newest incomplete one (AC-4.3). Ignored if --force-fresh is given.",
+)
+@click.option(
+    "--force-fresh",
+    is_flag=True,
+    default=False,
+    help="Start a brand-new snapshot even if an incomplete one exists for this "
+    "org (AC-4.7), instead of resuming it automatically.",
+)
 @_credential_options
 @click.pass_context
 def run(
@@ -280,6 +294,8 @@ def run(
     exclude_archived: bool,
     exclude_forks: bool,
     max_items_per_collection: int | None,
+    resume: str | None,
+    force_fresh: bool,
     app_private_key_path: str | None,
     app_client_id: str | None,
     token: str | None,
@@ -317,6 +333,8 @@ def run(
                 dataset_names=_split_csv_option(datasets),
                 repository_filter=None if repository_filter.is_noop else repository_filter,
                 item_cap=max_items_per_collection,
+                resume=resume,
+                force_fresh=force_fresh,
             )
         )
     except KeyboardInterrupt:
@@ -337,6 +355,8 @@ async def _do_run(
     dataset_names: tuple[str, ...] | None = None,
     repository_filter: RepositoryFilter | None = None,
     item_cap: int | None = None,
+    resume: str | None = None,
+    force_fresh: bool = False,
 ) -> RunResult:
     transport = Transport(provider)
     try:
@@ -350,6 +370,8 @@ async def _do_run(
             dataset_names=dataset_names,
             repository_filter=repository_filter,
             item_cap=item_cap,
+            resume=resume,
+            force_fresh=force_fresh,
         )
     finally:
         await transport.aclose()
@@ -358,6 +380,8 @@ async def _do_run(
 
 def _print_run_result(result: RunResult) -> None:
     manifest = result.manifest
+    if result.resumed_from is not None:
+        click.echo(f"resuming snapshot: {result.resumed_from}")
     if result.auto_included_datasets:
         click.echo(f"auto-included dependencies: {', '.join(result.auto_included_datasets)}")
     if manifest is not None:

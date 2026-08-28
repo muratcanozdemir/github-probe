@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from org_harvest.checkpoint import CheckpointStore
+from org_harvest.checkpoint import CURSOR_DONE, CheckpointStore
 from org_harvest.credentials import StaticTokenCredentialProvider
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.harvest.repo_level import (
@@ -700,4 +700,139 @@ class TestCursorIsolationAcrossDatasets:
         # pull_requests' very first request for R_1 must start at cursor
         # None, not at "C1" (issues' second-to-last page cursor).
         assert seen_cursors == [None]
+        await transport.aclose()
+
+
+class TestResume:
+    async def test_a_complete_dataset_is_not_refetched_ac_4_2_ac_4_5(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        (snapshot_dir / "issues.ndjson").write_text(
+            json.dumps({"id": "I_1", "repository_id": "R_1"}) + "\n", encoding="utf-8"
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("issues",)
+        )
+        checkpoint.set_dataset_status("issues", "complete")
+
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB, assert_all_called=False) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues",),
+                checkpoint=checkpoint,
+            )
+        assert calls["n"] == 0
+        assert result.dataset_outcomes[0].record_count == 1
+        await transport.aclose()
+
+    async def test_resumes_a_repo_mid_pagination_without_duplicating_ac_4_5(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        # Page 1 (I_1) was already written and checkpointed by a prior attempt.
+        (snapshot_dir / "issues.ndjson").write_text(
+            json.dumps({"id": "I_1", "repository_id": "R_1"}) + "\n", encoding="utf-8"
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("issues",)
+        )
+        checkpoint.set_cursor("issues:R_1", "C1")
+        pages = {"C1": {"has_next": False, "cursor": None, "nodes": [_issue_node(2)]}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "issues(" in body["query"]:
+                assert body["variables"]["repo0_cursor"] == "C1"
+            return _multi_page_issues_handler(pages)(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("issues",),
+                checkpoint=checkpoint,
+            )
+        issues = _read_lines(snapshot_dir / "issues.ndjson")
+        assert [i["id"] for i in issues] == ["I_1", "I_2"]
+        await transport.aclose()
+
+    async def test_a_done_repo_is_skipped_while_another_repo_resumes_ac_4_5(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1"), ("R_2", "repo2")])
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org="acme", dataset_selection=("labels",)
+        )
+        checkpoint.set_cursor("labels:R_1", CURSOR_DONE)
+
+        queried_repo_ids: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if "labels(" in body["query"]:
+                i = 0
+                while f"repo{i}_name" in body["variables"]:
+                    queried_repo_ids.append(body["variables"][f"repo{i}_name"])
+                    i += 1
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("labels",),
+                checkpoint=checkpoint,
+            )
+        assert queried_repo_ids == ["repo2"]
+        await transport.aclose()
+
+    async def test_a_done_non_paginated_spec_is_skipped_on_resume(self, tmp_path: Path):
+        snapshot_dir = tmp_path / "snapshot"
+        _write_repositories(snapshot_dir, [("R_1", "repo1")])
+        (snapshot_dir / "repo_custom_property_values.ndjson").write_text(
+            json.dumps({"id": "team", "repository_id": "R_1"}) + "\n", encoding="utf-8"
+        )
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json",
+            org="acme",
+            dataset_selection=("repo_custom_property_values",),
+        )
+        checkpoint.set_cursor("repo_custom_property_values:R_1", CURSOR_DONE)
+
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return _happy_path_handler(request)
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        with respx.mock(base_url=GITHUB, assert_all_called=False) as router:
+            router.post("/graphql").mock(side_effect=handler)
+            result = await fetch_repository_datasets(
+                transport,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("repo_custom_property_values",),
+                checkpoint=checkpoint,
+            )
+        assert calls["n"] == 0
+        assert result.dataset_outcomes[0].record_count == 1
         await transport.aclose()

@@ -43,3 +43,33 @@ class NdjsonWriter:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def read_ndjson_tolerant(path: Path) -> list[dict[str, Any]]:
+    """Reads every record from an NDJSON file, silently discarding a
+    trailing line that fails to parse (AC-4.6) — the signature of a
+    process killed mid-`write_record()`, after the newline-terminated
+    lines before it were already flushed and fsynced. A malformed line
+    anywhere *other* than the very last one is a real corruption, not
+    this expected case, and still raises. Returns `[]` if `path` doesn't
+    exist."""
+    if not path.exists():
+        return []
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records = []
+    for i, line in enumerate(lines):
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            if i == len(lines) - 1:
+                break  # a truncated trailing write from an abrupt kill — discard
+            raise
+    return records
+
+
+def count_records(path: Path) -> int:
+    """The true, on-disk record count for one NDJSON file (AC-4.5,
+    AC-4.6) — reading the file back rather than trusting an in-memory
+    tally is what makes a resumed dataset's reported count correct
+    whether or not any of its repositories were skipped this run."""
+    return len(read_ndjson_tolerant(path))

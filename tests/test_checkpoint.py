@@ -64,3 +64,26 @@ class TestCheckpointDurability:
         # A fresh load — simulating a process that crashed right after this
         # call — sees the mutation without any further save.
         assert CheckpointStore.load(path).dataset_status["organization"] == "complete"
+
+
+class TestCheckpointResume:
+    def test_resume_opens_the_same_state_a_fresh_load_would_see_ac_4_2(self, tmp_path: Path):
+        path = tmp_path / "checkpoint.json"
+        store = CheckpointStore.create(path, org="acme", dataset_selection=("organization",))
+        store.set_dataset_status("organization", "complete")
+        store.set_cursor("members", "CURSOR_A")
+
+        resumed = CheckpointStore.resume(path)
+        assert resumed.state.org == "acme"
+        assert resumed.state.dataset_status["organization"] == "complete"
+        assert resumed.state.cursors["members"] == "CURSOR_A"
+
+    def test_resumed_store_can_keep_mutating_and_saving(self, tmp_path: Path):
+        path = tmp_path / "checkpoint.json"
+        CheckpointStore.create(path, org="acme", dataset_selection=("organization", "members"))
+
+        resumed = CheckpointStore.resume(path)
+        resumed.set_dataset_status("members", "complete")
+
+        reloaded = CheckpointStore.load(path)
+        assert reloaded.dataset_status["members"] == "complete"

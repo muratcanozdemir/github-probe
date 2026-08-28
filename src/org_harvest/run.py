@@ -11,8 +11,13 @@ docstring), and — as of Story 11 — resolving the dataset selection and
 repository filter before any of the above runs (AC-2.4/AC-2.5: before any
 network call).
 
-Resume (Story 12/13) is layered on top of this by a later story: this
-module always starts from a fresh snapshot directory, start to finish.
+Story 12 layers resume on top: before creating a snapshot directory,
+`run_snapshot()` now checks (unless `force_fresh` is set) whether there is
+an existing snapshot to continue instead of starting fresh — a specific
+one, if `resume` names it (AC-4.3), otherwise the newest incomplete
+snapshot for this org (AC-4.2). Compatibility guards on a discovered
+checkpoint (schema version, org, selection match, staleness, concurrent-run
+locking) are Story 13's job, not this function's.
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ from org_harvest.manifest import (
     write_manifest,
 )
 from org_harvest.preflight import Verdict, run_preflight
+from org_harvest.resume import find_named_snapshot, find_newest_incomplete_snapshot
 from org_harvest.selection import RepositoryFilter, resolve_dataset_selection
 from org_harvest.timeutil import utc_now_compact, utc_now_iso
 from org_harvest.transport import Transport
@@ -127,6 +133,10 @@ class RunResult:
     #: selected depends on them (AC-2.6) — empty when nothing needed
     #: auto-inclusion, including every run with no `dataset_names` given.
     auto_included_datasets: tuple[str, ...] = ()
+    #: The pre-existing incomplete snapshot this run continued (Story 12,
+    #: AC-4.2/AC-4.3) — `None` when this run started a fresh snapshot
+    #: (including every run before Story 12, and any `force_fresh` run).
+    resumed_from: Path | None = None
 
 
 async def run_snapshot(
@@ -140,15 +150,25 @@ async def run_snapshot(
     dataset_names: Sequence[str] | None = None,
     repository_filter: RepositoryFilter | None = None,
     item_cap: int | None = None,
+    resume: str | None = None,
+    force_fresh: bool = False,
 ) -> RunResult:
     """Runs preflight, then Phase 1, then Phase 2, then finalizes and
-    writes the manifest — start to finish, in one new snapshot directory
-    (AC-1.5, AC-1.6, AC-1.7). `dataset_names` (`None` for the full default
-    tier, AC-2.2) is resolved — validated, dependency-closed (AC-2.6) —
-    before anything else happens, so an invalid selection (AC-2.4, AC-2.5)
-    never reaches preflight or spends a network call. `repository_filter`
-    and `item_cap` (AC-2.8, AC-2.9) are threaded to Phase 1 and Phase 2
-    respectively.
+    writes the manifest — in either a fresh snapshot directory or a
+    resumed one (AC-1.5, AC-1.6, AC-1.7). `dataset_names` (`None` for the
+    full default tier, AC-2.2) is resolved — validated, dependency-closed
+    (AC-2.6) — before anything else happens, so an invalid selection
+    (AC-2.4, AC-2.5) never reaches preflight or spends a network call.
+    `repository_filter` and `item_cap` (AC-2.8, AC-2.9) are threaded to
+    Phase 1 and Phase 2 respectively.
+
+    Resume selection (Story 12): unless `force_fresh` is set, this looks
+    for a snapshot to continue instead of starting a new one — the one
+    named by `resume` (AC-4.3), or otherwise the newest incomplete
+    snapshot already on disk for this org (AC-4.2). When neither applies
+    (no `resume` given and nothing incomplete is found), a fresh snapshot
+    is created exactly as before (AC-4.4). `RunResult.resumed_from` reports
+    which snapshot, if any, was resumed.
 
     Never raises `OrgHarvestError` — every failure this function's own
     collaborators can raise is caught and turned into the matching
@@ -166,6 +186,18 @@ async def run_snapshot(
     except OrgHarvestError as exc:
         return RunResult(
             exit_status_for_error(exc), None, None, perf_counter() - started_perf, str(exc)
+        )
+
+    org_dir = snapshot_root / org.lower()
+    if resume is not None and not force_fresh and find_named_snapshot(org_dir, resume) is None:
+        # A named resume target that doesn't exist is invalid independent of
+        # any network call (AC-4.3), same as an unknown dataset name.
+        return RunResult(
+            ExitStatus.INVALID_USAGE,
+            None,
+            None,
+            perf_counter() - started_perf,
+            f"no snapshot named {resume!r} found under {org_dir}",
         )
 
     try:
@@ -189,11 +221,24 @@ async def run_snapshot(
             f"preflight found blocked dataset(s): {blocked}",
         )
 
-    snapshot_dir = snapshot_root / org.lower() / utc_now_compact()
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = CheckpointStore.create(
-        snapshot_dir / "checkpoint.json", org=org, dataset_selection=selection.names
-    )
+    resumed_from: Path | None = None
+    if force_fresh:
+        candidate = None
+    elif resume is not None:
+        candidate = find_named_snapshot(org_dir, resume)  # already confirmed to exist, above
+    else:
+        candidate = find_newest_incomplete_snapshot(org_dir)
+
+    if candidate is not None:
+        snapshot_dir = candidate
+        checkpoint = CheckpointStore.resume(snapshot_dir / "checkpoint.json")
+        resumed_from = snapshot_dir
+    else:
+        snapshot_dir = org_dir / utc_now_compact()
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = CheckpointStore.create(
+            snapshot_dir / "checkpoint.json", org=org, dataset_selection=selection.names
+        )
     guard = SystemicFailureGuard()
 
     try:
@@ -226,6 +271,7 @@ async def run_snapshot(
             perf_counter() - started_perf,
             str(exc),
             auto_included_datasets=selection.auto_included,
+            resumed_from=resumed_from,
         )
 
     finalize_result = finalize_snapshot(snapshot_dir)
@@ -263,4 +309,5 @@ async def run_snapshot(
         manifest,
         perf_counter() - started_perf,
         auto_included_datasets=selection.auto_included,
+        resumed_from=resumed_from,
     )

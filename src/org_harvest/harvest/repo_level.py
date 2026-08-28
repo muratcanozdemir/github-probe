@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from org_harvest.checkpoint import CheckpointStore
+from org_harvest.checkpoint import CURSOR_DONE, CheckpointStore
 from org_harvest.datasets import DatasetLevel, complete_fetch_details, get
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.gaps import DatasetOutcome, Gap
@@ -49,7 +49,7 @@ from org_harvest.graphql import extract_rate_limit_snapshot
 from org_harvest.harvest.flatten import flatten_node
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
-from org_harvest.output import NdjsonWriter
+from org_harvest.output import NdjsonWriter, count_records
 from org_harvest.transport import Transport
 
 _DEFAULT_PAGE_SIZE = 50
@@ -430,6 +430,9 @@ class _RepoLevelHarvester:
                 batch[0].id,
                 "node limit exceeded even at minimum page size and batch width",
             )
+            # Permanent, not transient — a resumed run gains nothing by
+            # re-attempting the same unrecoverable query (AC-4.5).
+            self._checkpoint.set_cursor(f"{spec.dataset}:{batch[0].id}", CURSOR_DONE)
             return _BatchResult(gaps=[gap])
 
         errors_by_alias: dict[str, list[dict[str, Any]]] = {}
@@ -460,6 +463,7 @@ class _RepoLevelHarvester:
                             spec.dataset, repo.id, "no data returned for this repository"
                         )
                     )
+                self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", CURSOR_DONE)
                 continue
 
             connection = repo_data.get(spec.connection_field)
@@ -470,6 +474,7 @@ class _RepoLevelHarvester:
                             spec.dataset, repo.id, "no data returned for this dataset"
                         )
                     )
+                self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", CURSOR_DONE)
                 continue
 
             if spec.paginated:
@@ -501,6 +506,10 @@ class _RepoLevelHarvester:
                     repo.cursor = page_info["endCursor"]
                     result.still_pending.append(repo)
                     self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", repo.cursor)
+                else:
+                    self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", CURSOR_DONE)
+            else:
+                self._checkpoint.set_cursor(f"{spec.dataset}:{repo.id}", CURSOR_DONE)
 
         return result
 
@@ -522,24 +531,45 @@ class _RepoLevelHarvester:
     async def fetch_repo_dataset(
         self, spec: _RepoConnectionSpec, repos: list[_RepoState]
     ) -> DatasetOutcome:
+        if self._checkpoint.state.dataset_status.get(spec.dataset) == "complete":
+            return self._resumed_outcome(spec.dataset)
+
         # Each `_RepoState` is shared across every dataset's fetch (the same
         # objects are reused for every spec in `fetch_repository_datasets`'s
-        # loop) — reset cursor here so a previous dataset's pagination
-        # progress never leaks into this one's first page.
+        # loop), so this dataset's own checkpoint state — not whatever a
+        # previous dataset's fetch left on the object — decides where each
+        # repository starts: `None` if never attempted for this dataset, a
+        # real cursor if a prior attempt got partway through paginating it
+        # (AC-4.2, AC-4.5), or skipped entirely if already `CURSOR_DONE`
+        # (fully paginated, or ended in a recorded gap, in a prior attempt).
+        queue: list[_RepoState] = []
         for repo in repos:
-            repo.cursor = None
-        queue = list(repos)
-        count = 0
+            stored = self._checkpoint.state.cursors.get(f"{spec.dataset}:{repo.id}")
+            if stored == CURSOR_DONE:
+                continue
+            repo.cursor = stored
+            queue.append(repo)
+
         gaps: list[Gap] = []
         written_per_repo: dict[str, int] = {}
         while queue:
             batch, queue = queue[: self._batch_width], queue[self._batch_width :]
             result = await self._run_batch(spec, batch, self._page_size, written_per_repo)
-            count += result.written
             gaps.extend(result.gaps)
             queue.extend(result.still_pending)
         self._checkpoint.set_dataset_status(spec.dataset, "complete")
-        return DatasetOutcome(spec.dataset, count, tuple(gaps))
+        path = self._snapshot_dir / f"{spec.dataset}.ndjson"
+        return DatasetOutcome(spec.dataset, count_records(path), tuple(gaps))
+
+    def _resumed_outcome(self, dataset: str) -> DatasetOutcome:
+        """AC-4.2/AC-4.5: mirrors `org_level._OrgLevelHarvester._resumed_outcome` —
+        this whole dataset was already marked complete by a prior attempt,
+        so skip re-fetching it entirely."""
+        path = self._snapshot_dir / f"{dataset}.ndjson"
+        gaps = tuple(
+            Gap.from_dict(g) for g in self._checkpoint.state.gaps if g.get("dataset") == dataset
+        )
+        return DatasetOutcome(dataset, count_records(path), gaps)
 
 
 def _selection(spec: _RepoConnectionSpec) -> str:

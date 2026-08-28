@@ -6,6 +6,7 @@ incomplete file.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Any
 
 from org_harvest.timeutil import utc_now_iso
 
@@ -26,6 +27,21 @@ class Gap:
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> Gap:
+        """Reconstructs a `Gap` from its `to_dict()`/checkpoint-ledger
+        form (Story 12, AC-4.2/AC-4.5) — a resumed run's history is only
+        ever read back through this, never `Gap(**data)` directly, so a
+        loosely-typed loaded dict doesn't need to satisfy the dataclass's
+        exact field types on its own."""
+        return Gap(
+            dataset=str(data["dataset"]),
+            resource_id=data.get("resource_id"),
+            field_path=data.get("field_path"),
+            reason=str(data.get("reason", "")),
+            occurred_at=str(data.get("occurred_at", "")),
+        )
 
     @staticmethod
     def now(dataset: str, *, resource_id: str | None, field_path: str | None, reason: str) -> Gap:
