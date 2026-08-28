@@ -170,3 +170,24 @@ class CheckpointStore:
     def record_gap(self, gap: Gap) -> None:
         self.state.gaps.append(gap.to_dict())
         self.save()
+
+    def reset_dataset(self, dataset: str) -> None:
+        """Clears a dataset's completion status and every gap recorded
+        against it (Story 14, AC-11.2), so a retry can re-attempt it from
+        scratch and have the outcome reflect only the new attempt. Cursors
+        are cleared separately via `clear_cursor()` — a retry may need to
+        clear specific per-resource cursor keys (one per gapped team or
+        repository) rather than a single dataset-wide one."""
+        self.state.dataset_status.pop(dataset, None)
+        self.state.gaps = [g for g in self.state.gaps if g.get("dataset") != dataset]
+        self.save()
+
+    def clear_cursor(self, key: str) -> None:
+        """Removes a cursor entry entirely (Story 14, AC-11.2) — distinct
+        from `set_cursor(key, None)`, which would instead record "never
+        attempted," itself indistinguishable from a cursor that was
+        genuinely never touched. Used by retry to un-mark a specific
+        resource that finished (successfully or not) in a prior attempt,
+        including one recorded as `CURSOR_DONE`, so it's picked up fresh."""
+        self.state.cursors.pop(key, None)
+        self.save()

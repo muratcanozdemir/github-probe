@@ -19,7 +19,9 @@ from org_harvest.credentials import CredentialProvider, build_credential_provide
 from org_harvest.datasets import all_specs
 from org_harvest.errors import OrgHarvestError
 from org_harvest.hosts import ApiHost
+from org_harvest.manifest import CompletionStatus
 from org_harvest.preflight import PreflightReport, Verdict, run_preflight
+from org_harvest.retry import RetryResult, retry_gaps
 from org_harvest.run import ExitStatus, RunResult, exit_status_for_error, run_snapshot
 from org_harvest.selection import RepositoryFilter, resolve_dataset_selection
 from org_harvest.transport import Transport
@@ -434,6 +436,91 @@ def _print_run_result(result: RunResult) -> None:
             click.echo(f"snapshot (incomplete): {result.snapshot_dir}", err=True)
         if result.message:
             click.echo(f"error: {result.message}", err=True)
+
+
+@main.command("retry-gaps")
+@click.argument("org")
+@click.argument("snapshot")
+@click.option(
+    "--snapshot-root",
+    default=_DEFAULT_SNAPSHOT_ROOT,
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Root the snapshot lives under — must match the original run's --snapshot-root (AC-1.6).",
+)
+@_credential_options
+@click.pass_context
+def retry_gaps_command(
+    ctx: click.Context,
+    org: str,
+    snapshot: str,
+    snapshot_root: Path,
+    app_private_key_path: str | None,
+    app_client_id: str | None,
+    token: str | None,
+    api_host: str,
+) -> None:
+    """Re-attempt only the gapped resources of an existing, completed
+    SNAPSHOT of ORG (AC-11.1) — SNAPSHOT is the timestamp directory name a
+    prior `run` printed."""
+    _warn_if_token_on_command_line(ctx)
+    snapshot_dir = snapshot_root / org.lower() / snapshot
+    try:
+        provider = build_credential_provider(
+            private_key_path=app_private_key_path,
+            client_id=app_client_id,
+            token=token,
+            org=org,
+            api_host=ApiHost(api_host),
+        )
+    except OrgHarvestError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(exit_status_for_error(exc))
+
+    try:
+        result = _run_async(
+            _do_retry_gaps(provider, org=org, snapshot_dir=snapshot_dir, api_host=api_host)
+        )
+    except OrgHarvestError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(exit_status_for_error(exc))
+
+    _print_retry_result(result)
+    if not result.retried:
+        sys.exit(ExitStatus.SUCCESS)
+    status = (
+        ExitStatus.SUCCESS
+        if result.manifest.status is CompletionStatus.COMPLETE
+        else ExitStatus.COMPLETED_WITH_GAPS
+    )
+    sys.exit(status)
+
+
+async def _do_retry_gaps(
+    provider: CredentialProvider, *, org: str, snapshot_dir: Path, api_host: str
+) -> RetryResult:
+    transport = Transport(provider)
+    try:
+        return await retry_gaps(
+            transport, provider, org=org, snapshot_dir=snapshot_dir, api_host=ApiHost(api_host)
+        )
+    finally:
+        await transport.aclose()
+        await provider.aclose()
+
+
+def _print_retry_result(result: RetryResult) -> None:
+    if not result.retried:
+        click.echo("no gaps to retry — snapshot is already clean")
+        return
+    click.echo(f"retried datasets: {', '.join(result.datasets_retried)}")
+    for name, count in sorted(result.manifest.dataset_counts.items()):
+        click.echo(f"  {name}: {count}")
+    if result.manifest.gaps:
+        click.echo(f"still {len(result.manifest.gaps)} gap(s) remaining")
+    else:
+        click.echo("all gaps resolved")
+    click.echo(f"retried at: {result.manifest.last_retried_at}")
 
 
 if __name__ == "__main__":

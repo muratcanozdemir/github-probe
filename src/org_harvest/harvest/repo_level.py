@@ -602,6 +602,7 @@ async def fetch_repository_datasets(
     dataset_names: Sequence[str] | None = None,
     item_cap: int | None = None,
     interrupt: InterruptGuard | None = None,
+    repository_ids: frozenset[str] | None = None,
 ) -> RepoLevelResult:
     """Fetches repository-level datasets (AC-1.2) for every repository
     Story 5 wrote to `repositories.ndjson`, and writes each dataset to
@@ -617,7 +618,9 @@ async def fetch_repository_datasets(
     *selectable* without implementing its fetch) becomes a single explicit
     gap. `item_cap` (AC-2.9) stops collecting further items for a
     repository, dataset pair once that many have been written, even if
-    more pages remain.
+    more pages remain. `repository_ids` (Story 14, AC-11.1) narrows the
+    fan-out to just the named repositories — `None` (the default) fans out
+    over every repository, matching pre-Story-14 behavior.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 1 by the caller if desired, or left
@@ -638,6 +641,8 @@ async def fetch_repository_datasets(
             dataset_selection=effective_selection,
         )
     repos = _read_repositories(snapshot_dir)
+    if repository_ids is not None:
+        repos = [r for r in repos if r.id in repository_ids]
     harvester = _RepoLevelHarvester(
         transport,
         org=org,

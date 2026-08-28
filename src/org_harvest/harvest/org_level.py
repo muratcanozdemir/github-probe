@@ -548,6 +548,7 @@ async def fetch_organization_directory(
     dataset_names: Sequence[str] | None = None,
     repository_filter: RepositoryFilter | None = None,
     interrupt: InterruptGuard | None = None,
+    team_ids: frozenset[str] | None = None,
 ) -> OrgLevelResult:
     """Fetches organization-level datasets (AC-1.2) and writes each to
     `snapshot_dir` as NDJSON. `dataset_names` narrows or expands the
@@ -561,7 +562,10 @@ async def fetch_organization_directory(
     result as complete. `repository_filter` (AC-2.8) is applied while
     writing the `repositories` dataset, which is also Phase 2's fan-out
     source (architecture.md, Decision 4) — filtering there narrows both at
-    once.
+    once. `team_ids` (Story 14, AC-11.1) narrows `team_members`/
+    `team_repositories` to just the named teams — `None` (the default)
+    fetches every team, matching pre-Story-14 behavior; it has no effect
+    on any other dataset.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 2 by the caller if desired, or left
@@ -619,6 +623,10 @@ async def fetch_organization_directory(
     needs_team_repositories = selected is None or "team_repositories" in selected
     if not harvester.interrupted and (needs_team_members or needs_team_repositories):
         teams = _read_ndjson(snapshot_dir / "teams.ndjson")
+        if team_ids is not None:
+            # Story 14, AC-11.1: retry-gaps narrows to just the teams that
+            # gapped, rather than re-paginating every team's connection.
+            teams = [t for t in teams if t["id"] in team_ids]
         if needs_team_members:
             outcomes.append(
                 await harvester.fetch_team_connection(

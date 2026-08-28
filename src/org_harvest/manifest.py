@@ -163,13 +163,16 @@ def build_manifest(
     scope_restricted: bool = False,
     conversion_outcomes: tuple[DatasetOutcome, ...] = (),
     consumption: ConsumptionStats | None = None,
+    last_retried_at: str | None = None,
 ) -> Manifest:
     """Aggregates Stories 5–8's outputs into one manifest. `dataset_outcomes`
     is every dataset's fetch result (org-level and repository-level
     combined — record counts come from here, since that's what was
     actually downloaded); `conversion_outcomes` (Story 8's `FinalizeResult`)
     contributes its own gaps (a conversion failure) without touching the
-    counts already established by the fetch."""
+    counts already established by the fetch. `last_retried_at` (Story 14,
+    AC-11.3) is set by `retry_gaps()` when it rebuilds this snapshot's
+    manifest after a retry; every other caller leaves it `None`."""
     dataset_counts = {outcome.name: outcome.record_count for outcome in dataset_outcomes}
     gaps: list[Gap] = [g for outcome in dataset_outcomes for g in outcome.gaps]
     gaps.extend(g for outcome in conversion_outcomes for g in outcome.gaps)
@@ -184,6 +187,7 @@ def build_manifest(
         gaps=tuple(gaps),
         scope_restricted=scope_restricted,
         consumption=consumption or ConsumptionStats(),
+        last_retried_at=last_retried_at,
     )
 
 

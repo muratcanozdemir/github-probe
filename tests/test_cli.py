@@ -642,3 +642,94 @@ class TestRunCommandResumeSafetyOptions:
         assert invocation.exit_code == 130
         assert "error:" not in invocation.output
         assert "resume with: org-harvest run acme --resume 20260101T000000Z" in invocation.output
+
+
+class TestRetryGapsCommand:
+    def test_reports_no_op_and_exits_zero_when_no_gaps_ac_11_5(self, tmp_path, monkeypatch):
+        from org_harvest.retry import RetryResult
+
+        async def fake_do_retry(provider, *, org, snapshot_dir, api_host):
+            return RetryResult(retried=False, manifest=_manifest_stub())
+
+        monkeypatch.setattr("org_harvest.cli._do_retry_gaps", fake_do_retry)
+        runner = CliRunner()
+        result = runner.invoke(main, ["retry-gaps", "acme", "20260101T000000Z", "--token", "ghs_x"])
+        assert result.exit_code == 0
+        assert "no gaps to retry" in result.output
+
+    def test_reports_retried_datasets_and_exits_zero_when_all_resolved(self, tmp_path, monkeypatch):
+        from org_harvest.retry import RetryResult
+
+        async def fake_do_retry(provider, *, org, snapshot_dir, api_host):
+            return RetryResult(
+                retried=True, manifest=_manifest_stub(gaps=()), datasets_retried=("issues",)
+            )
+
+        monkeypatch.setattr("org_harvest.cli._do_retry_gaps", fake_do_retry)
+        runner = CliRunner()
+        result = runner.invoke(main, ["retry-gaps", "acme", "20260101T000000Z", "--token", "ghs_x"])
+        assert result.exit_code == 0
+        assert "retried datasets: issues" in result.output
+        assert "all gaps resolved" in result.output
+
+    def test_exits_with_completed_with_gaps_when_some_gaps_remain(self, tmp_path, monkeypatch):
+        from org_harvest.gaps import Gap
+        from org_harvest.retry import RetryResult
+        from org_harvest.run import ExitStatus
+
+        remaining_gap = Gap.now("issues", resource_id="R_1", field_path=None, reason="still broken")
+
+        async def fake_do_retry(provider, *, org, snapshot_dir, api_host):
+            return RetryResult(
+                retried=True,
+                manifest=_manifest_stub(gaps=(remaining_gap,)),
+                datasets_retried=("issues",),
+            )
+
+        monkeypatch.setattr("org_harvest.cli._do_retry_gaps", fake_do_retry)
+        runner = CliRunner()
+        result = runner.invoke(main, ["retry-gaps", "acme", "20260101T000000Z", "--token", "ghs_x"])
+        assert result.exit_code == ExitStatus.COMPLETED_WITH_GAPS
+        assert "still 1 gap(s) remaining" in result.output
+
+    def test_snapshot_dir_is_built_from_org_and_snapshot_root(self, tmp_path, monkeypatch):
+        from org_harvest.retry import RetryResult
+
+        captured = {}
+
+        async def fake_do_retry(provider, *, org, snapshot_dir, api_host):
+            captured["snapshot_dir"] = snapshot_dir
+            return RetryResult(retried=False, manifest=_manifest_stub())
+
+        monkeypatch.setattr("org_harvest.cli._do_retry_gaps", fake_do_retry)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "retry-gaps",
+                "ACME",
+                "20260101T000000Z",
+                "--snapshot-root",
+                str(tmp_path),
+                "--token",
+                "ghs_x",
+            ],
+        )
+        assert result.exit_code == 0
+        assert captured["snapshot_dir"] == tmp_path / "acme" / "20260101T000000Z"
+
+
+def _manifest_stub(gaps=()):
+    from org_harvest.gaps import DatasetOutcome
+    from org_harvest.manifest import ConsumptionStats, build_manifest
+
+    return build_manifest(
+        org="acme",
+        api_host="github.com",
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:01:00+00:00",
+        dataset_selection=("issues",),
+        dataset_outcomes=(DatasetOutcome("issues", 5, gaps),),
+        consumption=ConsumptionStats(),
+        last_retried_at="2026-01-02T00:00:00+00:00",
+    )
