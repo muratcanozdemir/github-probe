@@ -56,6 +56,7 @@ from org_harvest.manifest import (
     write_manifest,
 )
 from org_harvest.preflight import Verdict, run_preflight
+from org_harvest.progress import ProgressCallback, ProgressEvent, ProgressEventKind
 from org_harvest.resume import find_named_snapshot, find_newest_incomplete_snapshot
 from org_harvest.selection import DatasetSelection, RepositoryFilter, resolve_dataset_selection
 from org_harvest.timeutil import parse_compact_utc, utc_now_compact, utc_now_iso
@@ -224,6 +225,7 @@ async def run_snapshot(
     force_fresh: bool = False,
     stale_after_days: float = _DEFAULT_STALE_AFTER_DAYS,
     allow_stale_resume: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> RunResult:
     """Runs preflight, then Phase 1, then Phase 2, then finalizes and
     writes the manifest — in either a fresh snapshot directory or a
@@ -264,7 +266,18 @@ async def run_snapshot(
     function's own collaborators can raise is caught and turned into the
     matching `RunResult.exit_status` (FR-10) instead, since a caller (the
     CLI, or a future library caller) needs a result to report either way.
-    """
+
+    `on_progress` (Story 15, AC-9.4) is called as the run proceeds — once
+    per phase boundary, once per dataset as its outcome becomes known, and
+    once per rate-limit wait `transport` actually takes — rather than only
+    once at the very end. `None` (the default) means no observation at
+    all, at zero cost beyond the `is not None` checks."""
+
+    def _emit_phase(kind: ProgressEventKind, phase: str) -> None:
+        if on_progress is not None:
+            verb = "starting" if kind is ProgressEventKind.PHASE_STARTED else "finished"
+            on_progress(ProgressEvent(kind=kind, message=f"{verb}: {phase}", phase=phase))
+
     host = api_host or ApiHost()
     started_perf = perf_counter()
     started_at = utc_now_iso()
@@ -358,6 +371,7 @@ async def run_snapshot(
         )
 
     with claim:
+        _emit_phase(ProgressEventKind.PHASE_STARTED, "preflight")
         try:
             report = await run_preflight(
                 transport, credentials, org=org, dataset_names=selection.names, api_host=host
@@ -371,6 +385,7 @@ async def run_snapshot(
                 str(exc),
                 reclaimed_stale_claim=claim.reclaimed_stale,
             )
+        _emit_phase(ProgressEventKind.PHASE_COMPLETE, "preflight")
 
         if fail_fast and report.any_blocked:
             blocked = ", ".join(
@@ -412,6 +427,17 @@ async def run_snapshot(
         guard = SystemicFailureGuard()
         interrupt = InterruptGuard()
 
+        if on_progress is not None:
+            transport.set_wait_callback(
+                lambda seconds: on_progress(
+                    ProgressEvent(
+                        kind=ProgressEventKind.RATE_LIMIT_WAIT,
+                        message=f"waiting {seconds:.1f}s for the rate limit to recover",
+                        wait_seconds=seconds,
+                    )
+                )
+            )
+
         def _interrupted_result() -> RunResult:
             resume_cmd = f"org-harvest run {org} --resume {snapshot_dir.name}"
             return RunResult(
@@ -426,6 +452,7 @@ async def run_snapshot(
             )
 
         with interrupt:
+            _emit_phase(ProgressEventKind.PHASE_STARTED, "phase1")
             try:
                 org_result = await fetch_organization_directory(
                     transport,
@@ -438,6 +465,7 @@ async def run_snapshot(
                     dataset_names=selection.names,
                     repository_filter=repository_filter,
                     interrupt=interrupt,
+                    on_progress=on_progress,
                 )
             except OrgHarvestError as exc:
                 return RunResult(
@@ -451,9 +479,11 @@ async def run_snapshot(
                     reclaimed_stale_claim=claim.reclaimed_stale,
                 )
 
+            _emit_phase(ProgressEventKind.PHASE_COMPLETE, "phase1")
             if interrupt.requested:
                 return _interrupted_result()
 
+            _emit_phase(ProgressEventKind.PHASE_STARTED, "phase2")
             try:
                 repo_result = await fetch_repository_datasets(
                     transport,
@@ -465,6 +495,7 @@ async def run_snapshot(
                     dataset_names=selection.names,
                     item_cap=item_cap,
                     interrupt=interrupt,
+                    on_progress=on_progress,
                 )
             except OrgHarvestError as exc:
                 return RunResult(
@@ -478,10 +509,13 @@ async def run_snapshot(
                     reclaimed_stale_claim=claim.reclaimed_stale,
                 )
 
+            _emit_phase(ProgressEventKind.PHASE_COMPLETE, "phase2")
             if interrupt.requested:
                 return _interrupted_result()
 
+        _emit_phase(ProgressEventKind.PHASE_STARTED, "finalize")
         finalize_result = finalize_snapshot(snapshot_dir)
+        _emit_phase(ProgressEventKind.PHASE_COMPLETE, "finalize")
         completed_at = utc_now_iso()
 
         consumption = ConsumptionStats(

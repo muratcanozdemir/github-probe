@@ -21,6 +21,7 @@ from org_harvest.errors import OrgHarvestError
 from org_harvest.hosts import ApiHost
 from org_harvest.manifest import CompletionStatus
 from org_harvest.preflight import PreflightReport, Verdict, run_preflight
+from org_harvest.progress import ProgressCallback, ProgressEvent
 from org_harvest.retry import RetryResult, retry_gaps
 from org_harvest.run import ExitStatus, RunResult, exit_status_for_error, run_snapshot
 from org_harvest.selection import RepositoryFilter, resolve_dataset_selection
@@ -298,6 +299,13 @@ def _print_preflight_report(report: PreflightReport) -> None:
     default=False,
     help="Resume a snapshot even if it's older than --stale-after-days (AC-4.10).",
 )
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Print progress to stderr as the run proceeds — phase boundaries, each "
+    "dataset as it finishes, and rate-limit waits (Story 15, AC-9.4).",
+)
 @_credential_options
 @click.pass_context
 def run(
@@ -314,6 +322,7 @@ def run(
     force_fresh: bool,
     stale_after_days: float,
     allow_stale_resume: bool,
+    verbose: bool,
     app_private_key_path: str | None,
     app_client_id: str | None,
     token: str | None,
@@ -355,6 +364,7 @@ def run(
                 force_fresh=force_fresh,
                 stale_after_days=stale_after_days,
                 allow_stale_resume=allow_stale_resume,
+                on_progress=_print_progress_event if verbose else None,
             )
         )
     except KeyboardInterrupt:
@@ -379,6 +389,7 @@ async def _do_run(
     force_fresh: bool = False,
     stale_after_days: float = 7.0,
     allow_stale_resume: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> RunResult:
     transport = Transport(provider)
     try:
@@ -396,10 +407,17 @@ async def _do_run(
             force_fresh=force_fresh,
             stale_after_days=stale_after_days,
             allow_stale_resume=allow_stale_resume,
+            on_progress=on_progress,
         )
     finally:
         await transport.aclose()
         await provider.aclose()
+
+
+def _print_progress_event(event: ProgressEvent) -> None:
+    """The `--verbose` progress printer (Story 15, AC-9.4) — one line per
+    event, to stderr so it never mixes with the result summary on stdout."""
+    click.echo(f"[progress] {event.message}", err=True)
 
 
 def _print_run_result(result: RunResult) -> None:

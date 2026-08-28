@@ -45,6 +45,7 @@ from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.interrupt import InterruptGuard
 from org_harvest.output import NdjsonWriter, count_records
+from org_harvest.progress import ProgressCallback, ProgressEvent, ProgressEventKind
 from org_harvest.selection import RepositoryFilter
 from org_harvest.transport import Transport
 
@@ -549,6 +550,7 @@ async def fetch_organization_directory(
     repository_filter: RepositoryFilter | None = None,
     interrupt: InterruptGuard | None = None,
     team_ids: frozenset[str] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> OrgLevelResult:
     """Fetches organization-level datasets (AC-1.2) and writes each to
     `snapshot_dir` as NDJSON. `dataset_names` narrows or expands the
@@ -565,7 +567,8 @@ async def fetch_organization_directory(
     once. `team_ids` (Story 14, AC-11.1) narrows `team_members`/
     `team_repositories` to just the named teams — `None` (the default)
     fetches every team, matching pre-Story-14 behavior; it has no effect
-    on any other dataset.
+    on any other dataset. `on_progress` (Story 15, AC-9.4) is called once
+    per dataset, right after that dataset's outcome is known.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 2 by the caller if desired, or left
@@ -598,8 +601,23 @@ async def fetch_organization_directory(
     )
 
     outcomes: list[DatasetOutcome] = []
+
+    def _emit(outcome: DatasetOutcome) -> None:
+        outcomes.append(outcome)
+        if on_progress is not None:
+            on_progress(
+                ProgressEvent(
+                    kind=ProgressEventKind.DATASET_COMPLETE,
+                    message=f"{outcome.name}: {outcome.record_count} record(s), "
+                    f"{len(outcome.gaps)} gap(s)",
+                    dataset=outcome.name,
+                    record_count=outcome.record_count,
+                    gap_count=len(outcome.gaps),
+                )
+            )
+
     if (selected is None or "organization" in selected) and not harvester.interrupted:
-        outcomes.append(await harvester.fetch_organization_scalar())
+        _emit(await harvester.fetch_organization_scalar())
 
     connections_by_name = {spec.dataset: spec for spec in _ORG_CONNECTIONS}
     reachable_repository_count = 0
@@ -609,14 +627,14 @@ async def fetch_organization_directory(
         if selected is not None and name not in selected:
             continue
         outcome = await harvester.fetch_org_connection(connections_by_name[name])
-        outcomes.append(outcome)
+        _emit(outcome)
         if name == "repositories":
             reachable_repository_count = outcome.record_count
     for name in ("org_rulesets", "org_custom_properties", "org_domains", "org_ip_allow_list"):
         if harvester.interrupted:
             break
         if selected is None or name in selected:
-            outcomes.append(await harvester.fetch_org_connection(connections_by_name[name]))
+            _emit(await harvester.fetch_org_connection(connections_by_name[name]))
 
     team_connections_by_name = {spec.dataset: spec for spec in _TEAM_CONNECTIONS}
     needs_team_members = selected is None or "team_members" in selected
@@ -628,13 +646,13 @@ async def fetch_organization_directory(
             # gapped, rather than re-paginating every team's connection.
             teams = [t for t in teams if t["id"] in team_ids]
         if needs_team_members:
-            outcomes.append(
+            _emit(
                 await harvester.fetch_team_connection(
                     team_connections_by_name["team_members"], teams
                 )
             )
         if needs_team_repositories and not harvester.interrupted:
-            outcomes.append(
+            _emit(
                 await harvester.fetch_team_connection(
                     team_connections_by_name["team_repositories"], teams
                 )
@@ -649,7 +667,7 @@ async def fetch_organization_directory(
                 name, resource_id=None, field_path=None, reason="dataset not yet implemented"
             )
             checkpoint.record_gap(gap)
-            outcomes.append(DatasetOutcome(name, 0, (gap,)))
+            _emit(DatasetOutcome(name, 0, (gap,)))
 
     return OrgLevelResult(
         dataset_outcomes=tuple(outcomes),

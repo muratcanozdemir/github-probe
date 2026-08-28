@@ -51,6 +51,7 @@ from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
 from org_harvest.interrupt import InterruptGuard
 from org_harvest.output import NdjsonWriter, count_records
+from org_harvest.progress import ProgressCallback, ProgressEvent, ProgressEventKind
 from org_harvest.transport import Transport
 
 _DEFAULT_PAGE_SIZE = 50
@@ -603,6 +604,7 @@ async def fetch_repository_datasets(
     item_cap: int | None = None,
     interrupt: InterruptGuard | None = None,
     repository_ids: frozenset[str] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> RepoLevelResult:
     """Fetches repository-level datasets (AC-1.2) for every repository
     Story 5 wrote to `repositories.ndjson`, and writes each dataset to
@@ -620,7 +622,9 @@ async def fetch_repository_datasets(
     repository, dataset pair once that many have been written, even if
     more pages remain. `repository_ids` (Story 14, AC-11.1) narrows the
     fan-out to just the named repositories — `None` (the default) fans out
-    over every repository, matching pre-Story-14 behavior.
+    over every repository, matching pre-Story-14 behavior. `on_progress`
+    (Story 15, AC-9.4) is called once per dataset, right after that
+    dataset's outcome (across every repository) is known.
 
     Raises `OrgHarvestError(kind=SYSTEMIC_FAILURE)` (FR-5, EC-8) if
     `systemic_guard` — shared with Phase 1 by the caller if desired, or left
@@ -655,13 +659,28 @@ async def fetch_repository_datasets(
         item_cap=item_cap,
         interrupt=interrupt or InterruptGuard(),
     )
-    outcomes = []
+    outcomes: list[DatasetOutcome] = []
+
+    def _emit(outcome: DatasetOutcome) -> None:
+        outcomes.append(outcome)
+        if on_progress is not None:
+            on_progress(
+                ProgressEvent(
+                    kind=ProgressEventKind.DATASET_COMPLETE,
+                    message=f"{outcome.name}: {outcome.record_count} record(s), "
+                    f"{len(outcome.gaps)} gap(s)",
+                    dataset=outcome.name,
+                    record_count=outcome.record_count,
+                    gap_count=len(outcome.gaps),
+                )
+            )
+
     try:
         for spec in _REPO_CONNECTIONS:
             if harvester.interrupted:
                 break
             if selected is None or spec.dataset in selected:
-                outcomes.append(await harvester.fetch_repo_dataset(spec, list(repos)))
+                _emit(await harvester.fetch_repo_dataset(spec, list(repos)))
     finally:
         harvester.close_writers()
 
@@ -674,6 +693,6 @@ async def fetch_repository_datasets(
                 name, resource_id=None, field_path=None, reason="dataset not yet implemented"
             )
             checkpoint.record_gap(gap)
-            outcomes.append(DatasetOutcome(name, 0, (gap,)))
+            _emit(DatasetOutcome(name, 0, (gap,)))
 
     return RepoLevelResult(dataset_outcomes=tuple(outcomes))

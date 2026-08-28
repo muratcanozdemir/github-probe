@@ -733,3 +733,60 @@ def _manifest_stub(gaps=()):
         consumption=ConsumptionStats(),
         last_retried_at="2026-01-02T00:00:00+00:00",
     )
+
+
+class TestRunCommandVerbose:
+    """Story 15, AC-9.4 — `--verbose` installs a progress printer; without
+    it, no progress callback is wired at all."""
+
+    def test_verbose_flag_passes_a_progress_printer_to_do_run(self, tmp_path: Path, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured: dict[str, object] = {}
+
+        async def fake_do_run(*args, **kwargs):
+            captured["on_progress"] = kwargs.get("on_progress")
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        result = runner.invoke(main, ["run", "acme", "--token", "ghs_x", "--verbose"])
+        assert result.exit_code == 0
+        assert captured["on_progress"] is not None
+
+    def test_without_verbose_no_progress_callback_is_passed(self, tmp_path: Path, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured: dict[str, object] = {}
+
+        async def fake_do_run(*args, **kwargs):
+            captured["on_progress"] = kwargs.get("on_progress")
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        result = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert result.exit_code == 0
+        assert captured["on_progress"] is None
+
+    def test_verbose_prints_progress_events_to_stderr(self, monkeypatch):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+        from org_harvest.run import ExitStatus, RunResult
+
+        async def fake_do_run(*args, **kwargs):
+            on_progress = kwargs.get("on_progress")
+            assert on_progress is not None
+            on_progress(
+                ProgressEvent(
+                    kind=ProgressEventKind.PHASE_STARTED,
+                    message="starting: preflight",
+                    phase="preflight",
+                )
+            )
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        result = runner.invoke(main, ["run", "acme", "--token", "ghs_x", "--verbose"])
+        assert result.exit_code == 0
+        assert "starting: preflight" in result.stderr

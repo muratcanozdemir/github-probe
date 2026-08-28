@@ -91,6 +91,19 @@ class Transport:
         self._graphql_request_count = 0
         self._rest_request_count = 0
         self._rate_limit_wait_count = 0
+        #: Story 15, AC-9.4/FR-10 — notified with the wait duration every
+        #: time `send()` actually pauses for the rate limit, so a caller
+        #: observing progress sees this happen rather than only inferring
+        #: it afterward from `rate_limit_wait_count`/`total_wait_seconds`.
+        self._on_wait: Callable[[float], None] | None = None
+
+    def set_wait_callback(self, callback: Callable[[float], None] | None) -> None:
+        """Sets (or clears, with `None`) the callback invoked whenever a
+        request actually waits for the rate limit to recover. Exists as a
+        setter, not a constructor-only parameter, because `run_snapshot()`
+        (Story 15) receives an already-constructed `Transport` from its
+        caller rather than building its own."""
+        self._on_wait = callback
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -187,6 +200,8 @@ class Transport:
             )
             if waited is not None:
                 self._rate_limit_wait_count += 1
+                if self._on_wait is not None:
+                    self._on_wait(waited)
             headers = await self._build_headers(extra_headers, rest_style_headers)
 
             await self._limiter.acquire(now=self._now)

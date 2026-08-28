@@ -388,3 +388,48 @@ class TestRequestAndWaitCounters:
             assert transport.rate_limit_wait_count == 1
             assert calls == [30.0]
         await transport.aclose()
+
+
+class TestWaitCallback:
+    """Story 15, AC-9.4 — a caller can observe rate-limit waits as they
+    happen, via `set_wait_callback`."""
+
+    async def test_wait_callback_is_invoked_with_the_wait_duration(self):
+        calls, fake_sleep = _fake_sleep_recorder()
+        transport = _make_transport(sleep=fake_sleep, now=lambda: 1_000.0)
+        observed: list[float] = []
+        transport.set_wait_callback(observed.append)
+        budget = BudgetTracker("graphql")
+        with respx.mock:
+            respx.get(URL).mock(return_value=httpx.Response(200, json={}))
+            budget.update(RateLimitSnapshot(limit=5000, remaining=0, reset_at=1_030.0))
+            await transport.send("GET", URL, budget=budget)
+        assert observed == [30.0]
+        await transport.aclose()
+
+    async def test_wait_callback_is_not_invoked_when_no_wait_happens(self):
+        _, fake_sleep = _fake_sleep_recorder()
+        transport = _make_transport(sleep=fake_sleep, now=lambda: 1_000.0)
+        observed: list[float] = []
+        transport.set_wait_callback(observed.append)
+        budget = BudgetTracker("graphql")
+        with respx.mock:
+            respx.get(URL).mock(return_value=httpx.Response(200, json={}))
+            await transport.send("GET", URL, budget=budget)
+        assert observed == []
+        await transport.aclose()
+
+    async def test_set_wait_callback_none_clears_a_previously_set_callback(self):
+        calls, fake_sleep = _fake_sleep_recorder()
+        transport = _make_transport(sleep=fake_sleep, now=lambda: 1_000.0)
+        observed: list[float] = []
+        transport.set_wait_callback(observed.append)
+        transport.set_wait_callback(None)
+        budget = BudgetTracker("graphql")
+        with respx.mock:
+            respx.get(URL).mock(return_value=httpx.Response(200, json={}))
+            budget.update(RateLimitSnapshot(limit=5000, remaining=0, reset_at=1_030.0))
+            await transport.send("GET", URL, budget=budget)
+        assert observed == []
+        assert transport.rate_limit_wait_count == 1
+        await transport.aclose()

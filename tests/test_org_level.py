@@ -1099,3 +1099,74 @@ class TestInterrupt:
         assert "members" in names  # the in-flight dataset still finishes its call
         assert "pending_members" not in names  # never started once interrupted
         await transport.aclose()
+
+
+class TestProgress:
+    """Story 15, AC-9.4 — `on_progress` is called once per dataset, right
+    after that dataset's outcome is known."""
+
+    async def test_on_progress_emits_one_dataset_complete_event_per_dataset(self, tmp_path: Path):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        events: list[ProgressEvent] = []
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "members"),
+                on_progress=events.append,
+            )
+        assert all(e.kind is ProgressEventKind.DATASET_COMPLETE for e in events)
+        assert {e.dataset for e in events} == {"organization", "members"}
+        by_name = {e.dataset: e for e in events}
+        assert by_name["members"].record_count == 1
+        assert by_name["members"].gap_count == 0
+        assert "members" in by_name["members"].message
+        await transport.aclose()
+
+    async def test_no_on_progress_means_no_events_and_no_error(self, tmp_path: Path):
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            result = await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "members"),
+            )
+        assert {o.name for o in result.dataset_outcomes} == {"organization", "members"}
+        await transport.aclose()
+
+    async def test_a_not_yet_implemented_dataset_gap_also_emits_a_progress_event(
+        self, tmp_path: Path
+    ):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+
+        provider = StaticTokenCredentialProvider("ghs_x")
+        transport = Transport(provider)
+        snapshot_dir = tmp_path / "snapshot"
+        events: list[ProgressEvent] = []
+        with respx.mock(base_url=GITHUB) as router:
+            router.post("/graphql").mock(side_effect=_happy_path_handler)
+            await fetch_organization_directory(
+                transport,
+                provider,
+                org="acme",
+                snapshot_dir=snapshot_dir,
+                dataset_names=("organization", "audit_log"),
+                on_progress=events.append,
+            )
+        gap_events = [e for e in events if e.dataset == "audit_log"]
+        assert len(gap_events) == 1
+        assert gap_events[0].kind is ProgressEventKind.DATASET_COMPLETE
+        assert gap_events[0].gap_count == 1
+        await transport.aclose()

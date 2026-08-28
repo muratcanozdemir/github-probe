@@ -819,3 +819,136 @@ class TestInterruptOrchestration:
         assert result.exit_status is ExitStatus.USER_INTERRUPT
         assert not (tmp_path / "acme" / LOCK_FILENAME).exists()
         await transport.aclose()
+
+
+class TestProgress:
+    """Story 15, AC-9.4 — `on_progress` reports phase boundaries, each
+    dataset's outcome, and rate-limit waits as the run proceeds."""
+
+    async def test_phase_events_fire_in_order_around_each_phase(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+
+        _patch_success(monkeypatch)
+        transport = _transport()
+        events: list[ProgressEvent] = []
+        result = await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            on_progress=events.append,
+        )
+        assert result.exit_status is ExitStatus.SUCCESS
+        phase_events = [(e.kind, e.phase) for e in events if e.phase is not None]
+        assert phase_events == [
+            (ProgressEventKind.PHASE_STARTED, "preflight"),
+            (ProgressEventKind.PHASE_COMPLETE, "preflight"),
+            (ProgressEventKind.PHASE_STARTED, "phase1"),
+            (ProgressEventKind.PHASE_COMPLETE, "phase1"),
+            (ProgressEventKind.PHASE_STARTED, "phase2"),
+            (ProgressEventKind.PHASE_COMPLETE, "phase2"),
+            (ProgressEventKind.PHASE_STARTED, "finalize"),
+            (ProgressEventKind.PHASE_COMPLETE, "finalize"),
+        ]
+        await transport.aclose()
+
+    async def test_dataset_complete_events_from_each_phase_pass_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+
+        async def fake_preflight(*args, **kwargs):
+            return _report()
+
+        async def fake_fetch_org(*args, **kwargs):
+            on_progress = kwargs.get("on_progress")
+            if on_progress is not None:
+                on_progress(
+                    ProgressEvent(
+                        kind=ProgressEventKind.DATASET_COMPLETE,
+                        message="organization: 1 record(s), 0 gap(s)",
+                        dataset="organization",
+                        record_count=1,
+                        gap_count=0,
+                    )
+                )
+            return _org_result()
+
+        async def fake_fetch_repo(*args, **kwargs):
+            on_progress = kwargs.get("on_progress")
+            if on_progress is not None:
+                on_progress(
+                    ProgressEvent(
+                        kind=ProgressEventKind.DATASET_COMPLETE,
+                        message="issues: 5 record(s), 0 gap(s)",
+                        dataset="issues",
+                        record_count=5,
+                        gap_count=0,
+                    )
+                )
+            return _repo_result()
+
+        def fake_finalize(*args, **kwargs):
+            return FinalizeResult(())
+
+        monkeypatch.setattr("org_harvest.run.run_preflight", fake_preflight)
+        monkeypatch.setattr("org_harvest.run.fetch_organization_directory", fake_fetch_org)
+        monkeypatch.setattr("org_harvest.run.fetch_repository_datasets", fake_fetch_repo)
+        monkeypatch.setattr("org_harvest.run.finalize_snapshot", fake_finalize)
+
+        transport = _transport()
+        events: list[ProgressEvent] = []
+        await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            on_progress=events.append,
+        )
+        dataset_events = [e for e in events if e.kind is ProgressEventKind.DATASET_COMPLETE]
+        assert {e.dataset for e in dataset_events} == {"organization", "issues"}
+        await transport.aclose()
+
+    async def test_rate_limit_wait_events_are_wired_to_the_transport(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from org_harvest.progress import ProgressEvent, ProgressEventKind
+
+        _patch_success(monkeypatch)
+        transport = _transport()
+        captured: dict[str, object] = {}
+        original_set_wait_callback = transport.set_wait_callback
+
+        def recording_set_wait_callback(callback):
+            captured["callback"] = callback
+            original_set_wait_callback(callback)
+
+        monkeypatch.setattr(transport, "set_wait_callback", recording_set_wait_callback)
+        events: list[ProgressEvent] = []
+        await run_snapshot(
+            transport,
+            transport.credentials,
+            org="acme",
+            snapshot_root=tmp_path,
+            on_progress=events.append,
+        )
+        assert "callback" in captured
+        captured["callback"](3.5)  # type: ignore[operator]
+        wait_events = [e for e in events if e.kind is ProgressEventKind.RATE_LIMIT_WAIT]
+        assert len(wait_events) == 1
+        assert wait_events[0].wait_seconds == 3.5
+        assert "3.5" in wait_events[0].message
+        await transport.aclose()
+
+    async def test_no_on_progress_means_the_transport_wait_callback_is_never_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        _patch_success(monkeypatch)
+        transport = _transport()
+        calls: list[object] = []
+        monkeypatch.setattr(transport, "set_wait_callback", calls.append)
+        await run_snapshot(transport, transport.credentials, org="acme", snapshot_root=tmp_path)
+        assert calls == []
+        await transport.aclose()
