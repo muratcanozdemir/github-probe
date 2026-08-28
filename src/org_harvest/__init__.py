@@ -36,6 +36,7 @@ from org_harvest.manifest import (
 )
 from org_harvest.preflight import DatasetVerdict, PreflightReport, Verdict, run_preflight
 from org_harvest.ratelimit import BudgetTracker, ConcurrencyLimiter, RateLimitSnapshot
+from org_harvest.run import ExitStatus, RunResult, exit_status_for_error, run_snapshot
 from org_harvest.transport import Transport
 
 __all__ = [
@@ -54,6 +55,7 @@ __all__ = [
     "DatasetTier",
     "DatasetVerdict",
     "ErrorKind",
+    "ExitStatus",
     "FinalizeResult",
     "Gap",
     "Manifest",
@@ -63,6 +65,7 @@ __all__ = [
     "RateLimitSnapshot",
     "RepoLevelResult",
     "RootIndex",
+    "RunResult",
     "SystemicFailureGuard",
     "StaticTokenCredentialProvider",
     "Transport",
@@ -71,6 +74,7 @@ __all__ = [
     "build_credential_provider",
     "build_manifest",
     "default_dataset_names",
+    "exit_status_for_error",
     "fetch_organization_directory",
     "fetch_repository_datasets",
     "finalize_dataset",
@@ -80,5 +84,6 @@ __all__ = [
     "read_manifest",
     "rebuild_root_index",
     "run_preflight",
+    "run_snapshot",
     "write_manifest",
 ]

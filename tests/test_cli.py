@@ -208,3 +208,124 @@ def test_preflight_reports_scope_restriction_ec_3(rsa_private_key_path: Path):
         )
     assert result.exit_code == 0
     assert "scoped to selected repositories" in result.output
+
+
+class TestRunCommand:
+    def test_rejects_conflicting_credentials_before_any_network_call(self):
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--app-client-id", "Iv1.abc"]
+        )
+        assert result.exit_code == 3  # ExitStatus.INVALID_USAGE
+        assert "not both" in result.output
+
+    def test_success_prints_summary_and_exits_zero_ac_1_3(self, tmp_path: Path, monkeypatch):
+        from org_harvest.gaps import DatasetOutcome
+        from org_harvest.manifest import ConsumptionStats, build_manifest
+        from org_harvest.run import ExitStatus, RunResult
+
+        snapshot_dir = tmp_path / "acme" / "20260101T000000Z"
+        manifest = build_manifest(
+            org="acme",
+            api_host="github.com",
+            started_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T00:01:00+00:00",
+            dataset_selection=("organization",),
+            dataset_outcomes=(DatasetOutcome("organization", 1, ()),),
+            consumption=ConsumptionStats(
+                graphql_points_consumed=10,
+                graphql_requests=2,
+                rest_requests_consumed=0,
+                rate_limit_waits=1,
+            ),
+        )
+        result = RunResult(ExitStatus.SUCCESS, snapshot_dir, manifest, 12.5)
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 0
+        assert "organization: 1" in invocation.output
+        assert "elapsed: 12.5s" in invocation.output
+        assert "graphql points consumed: 10" in invocation.output
+        assert "rate-limit waits: 1" in invocation.output
+        assert str(snapshot_dir) in invocation.output
+
+    def test_completed_with_gaps_reports_gap_count_and_exits_one_ac_5_4(
+        self, tmp_path, monkeypatch
+    ):
+        from org_harvest.gaps import DatasetOutcome, Gap
+        from org_harvest.manifest import build_manifest
+        from org_harvest.run import ExitStatus, RunResult
+
+        snapshot_dir = tmp_path / "acme" / "20260101T000000Z"
+        gap = Gap.now("organization", resource_id=None, field_path=None, reason="boom")
+        manifest = build_manifest(
+            org="acme",
+            api_host="github.com",
+            started_at="s",
+            completed_at="c",
+            dataset_selection=("organization",),
+            dataset_outcomes=(DatasetOutcome("organization", 1, (gap,)),),
+        )
+        result = RunResult(ExitStatus.COMPLETED_WITH_GAPS, snapshot_dir, manifest, 1.0)
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 1
+        assert "completed with 1 gap(s)" in invocation.output
+
+    def test_preflight_blocked_exit_status_and_message(self, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        result = RunResult(
+            ExitStatus.PREFLIGHT_BLOCKED,
+            None,
+            None,
+            0.1,
+            "preflight found blocked dataset(s): organization",
+        )
+
+        async def fake_do_run(*args, **kwargs):
+            return result
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x", "--fail-fast"])
+        assert invocation.exit_code == 6  # ExitStatus.PREFLIGHT_BLOCKED
+        assert "preflight found blocked dataset(s)" in invocation.output
+
+    def test_keyboard_interrupt_exits_130_ac_10(self, monkeypatch):
+        async def fake_do_run(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        invocation = runner.invoke(main, ["run", "acme", "--token", "ghs_x"])
+        assert invocation.exit_code == 130
+        assert "interrupted" in invocation.output
+
+    def test_snapshot_root_option_is_accepted(self, tmp_path, monkeypatch):
+        from org_harvest.run import ExitStatus, RunResult
+
+        captured = {}
+
+        async def fake_do_run(provider, *, org, snapshot_root, api_host, fail_fast):
+            captured["snapshot_root"] = snapshot_root
+            return RunResult(ExitStatus.SUCCESS, None, None, 0.0)
+
+        monkeypatch.setattr("org_harvest.cli._do_run", fake_do_run)
+        runner = CliRunner()
+        custom_root = tmp_path / "custom-snapshots"
+        invocation = runner.invoke(
+            main, ["run", "acme", "--token", "ghs_x", "--snapshot-root", str(custom_root)]
+        )
+        assert invocation.exit_code == 0
+        assert captured["snapshot_root"] == custom_root

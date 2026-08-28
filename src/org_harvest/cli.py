@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
 import click
@@ -19,7 +20,12 @@ from org_harvest.datasets import all_specs, default_tier_names, get
 from org_harvest.errors import ErrorKind, OrgHarvestError
 from org_harvest.hosts import ApiHost
 from org_harvest.preflight import PreflightReport, Verdict, run_preflight
+from org_harvest.run import ExitStatus, RunResult, exit_status_for_error, run_snapshot
 from org_harvest.transport import Transport
+
+#: Default snapshot root (AC-1.6) — relative to the current working
+#: directory, matching how the tool is documented to be invoked.
+_DEFAULT_SNAPSHOT_ROOT = "snapshots"
 
 
 def _credential_options[**P, R](f: Callable[P, R]) -> Callable[P, R]:
@@ -217,6 +223,112 @@ def _print_preflight_report(report: PreflightReport) -> None:
         click.echo(f"estimated points: {report.estimated_points}")
     if report.estimated_duration_seconds is not None and report.estimated_duration_seconds > 0:
         click.echo(f"estimated additional wait: {report.estimated_duration_seconds:.0f}s")
+
+
+@main.command("run")
+@click.argument("org")
+@click.option(
+    "--snapshot-root",
+    default=_DEFAULT_SNAPSHOT_ROOT,
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Directory under which <org>/<timestamp>/ snapshots are written (AC-1.6).",
+)
+@click.option(
+    "--fail-fast",
+    is_flag=True,
+    default=False,
+    help="Abort before downloading anything if preflight finds a blocked dataset, "
+    "instead of proceeding and recording it as a gap (AC-6.4).",
+)
+@_credential_options
+@click.pass_context
+def run(
+    ctx: click.Context,
+    org: str,
+    snapshot_root: Path,
+    fail_fast: bool,
+    app_private_key_path: str | None,
+    app_client_id: str | None,
+    token: str | None,
+    api_host: str,
+) -> None:
+    """Download a complete snapshot of ORG in one command (AC-1.1)."""
+    _warn_if_token_on_command_line(ctx)
+    try:
+        provider = build_credential_provider(
+            private_key_path=app_private_key_path,
+            client_id=app_client_id,
+            token=token,
+            org=org,
+            api_host=ApiHost(api_host),
+        )
+    except OrgHarvestError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(exit_status_for_error(exc))
+
+    try:
+        result = _run_async(
+            _do_run(
+                provider,
+                org=org,
+                snapshot_root=snapshot_root,
+                api_host=api_host,
+                fail_fast=fail_fast,
+            )
+        )
+    except KeyboardInterrupt:
+        click.echo("interrupted", err=True)
+        sys.exit(ExitStatus.USER_INTERRUPT)
+
+    _print_run_result(result)
+    sys.exit(result.exit_status)
+
+
+async def _do_run(
+    provider: CredentialProvider,
+    *,
+    org: str,
+    snapshot_root: Path,
+    api_host: str,
+    fail_fast: bool,
+) -> RunResult:
+    transport = Transport(provider)
+    try:
+        return await run_snapshot(
+            transport,
+            provider,
+            org=org,
+            snapshot_root=snapshot_root,
+            api_host=ApiHost(api_host),
+            fail_fast=fail_fast,
+        )
+    finally:
+        await transport.aclose()
+        await provider.aclose()
+
+
+def _print_run_result(result: RunResult) -> None:
+    manifest = result.manifest
+    if manifest is not None:
+        for name, count in sorted(manifest.dataset_counts.items()):
+            click.echo(f"  {name}: {count}")
+        click.echo(f"elapsed: {result.elapsed_seconds:.1f}s")
+        c = manifest.consumption
+        click.echo(f"graphql points consumed: {c.graphql_points_consumed}")
+        click.echo(f"graphql requests: {c.graphql_requests}")
+        click.echo(f"rest requests consumed: {c.rest_requests_consumed}")
+        click.echo(f"rate-limit waits: {c.rate_limit_waits}")
+        if manifest.gaps:
+            click.echo(f"completed with {len(manifest.gaps)} gap(s)")
+        if manifest.scope_restricted:
+            click.echo("warning: installation is scoped to selected repositories, not all")
+        click.echo(f"snapshot: {result.snapshot_dir}")
+    else:
+        if result.snapshot_dir is not None:
+            click.echo(f"snapshot (incomplete): {result.snapshot_dir}", err=True)
+        if result.message:
+            click.echo(f"error: {result.message}", err=True)
 
 
 if __name__ == "__main__":

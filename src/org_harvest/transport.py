@@ -85,6 +85,12 @@ class Transport:
         self._sleep = sleep
         self._now = now
         self._jitter = jitter
+        #: Logical request counts and rate-limit-wait count (AC-1.3, Story
+        #: 10) — one increment per `send_graphql`/`send_rest` call (however
+        #: many retries it took internally), and one per actual pacing wait.
+        self._graphql_request_count = 0
+        self._rest_request_count = 0
+        self._rate_limit_wait_count = 0
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -101,6 +107,25 @@ class Transport:
         Transport's lifetime — reported in the run summary (AC-1.3)."""
         return self._total_wait_seconds
 
+    @property
+    def graphql_request_count(self) -> int:
+        """Number of `send_graphql` calls made over this Transport's
+        lifetime — reported in the run summary (AC-1.3)."""
+        return self._graphql_request_count
+
+    @property
+    def rest_request_count(self) -> int:
+        """Number of `send_rest` calls made over this Transport's
+        lifetime — reported in the run summary (AC-1.3)."""
+        return self._rest_request_count
+
+    @property
+    def rate_limit_wait_count(self) -> int:
+        """Number of times this Transport actually paused for a rate-limit
+        reset (as opposed to budget checks that found nothing to wait
+        for) — reported in the run summary (AC-1.3)."""
+        return self._rate_limit_wait_count
+
     async def send_graphql(
         self,
         url: str,
@@ -110,6 +135,7 @@ class Transport:
     ) -> httpx.Response:
         """Convenience wrapper pacing against the GraphQL point budget
         (AC-7.9)."""
+        self._graphql_request_count += 1
         return await self.send(
             "POST", url, budget=self.graphql_budget, extract_budget=extract_budget, json=payload
         )
@@ -124,6 +150,7 @@ class Transport:
     ) -> httpx.Response:
         """Convenience wrapper pacing against the separate REST request
         budget (AC-7.9)."""
+        self._rest_request_count += 1
         return await self.send(
             method,
             url,
@@ -152,12 +179,14 @@ class Transport:
         retry_after_seconds = 0.0
 
         for attempt in range(self._max_retries + 1):
-            await budget.wait_if_exhausted(
+            waited = await budget.wait_if_exhausted(
                 min_remaining=self._reserve_floor,
                 sleep=self._sleep,
                 now=self._now,
                 before_wait=self._check_wait_is_safe,
             )
+            if waited is not None:
+                self._rate_limit_wait_count += 1
             headers = await self._build_headers(extra_headers, rest_style_headers)
 
             await self._limiter.acquire(now=self._now)

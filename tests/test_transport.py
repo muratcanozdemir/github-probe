@@ -356,3 +356,35 @@ class TestSeparateBudgets:
             await transport.send_rest("GET", "https://example.test/rest")
         assert route.calls[0].request.headers["x-github-api-version"]
         await transport.aclose()
+
+
+class TestRequestAndWaitCounters:
+    async def test_send_graphql_and_send_rest_each_count_their_own_calls_ac_1_3(self):
+        transport = _make_transport()
+        with respx.mock:
+            respx.post("https://example.test/graphql").mock(
+                return_value=httpx.Response(200, json={})
+            )
+            respx.get("https://example.test/rest").mock(return_value=httpx.Response(200, json={}))
+            await transport.send_graphql("https://example.test/graphql", payload={})
+            await transport.send_graphql("https://example.test/graphql", payload={})
+            await transport.send_rest("GET", "https://example.test/rest")
+        assert transport.graphql_request_count == 2
+        assert transport.rest_request_count == 1
+        await transport.aclose()
+
+    async def test_rate_limit_wait_count_increments_only_when_a_wait_actually_happens(self):
+        calls, fake_sleep = _fake_sleep_recorder()
+        transport = _make_transport(sleep=fake_sleep, now=lambda: 1_000.0)
+        budget = BudgetTracker("graphql")
+        with respx.mock:
+            respx.get(URL).mock(return_value=httpx.Response(200, json={}))
+            # No snapshot yet -> no wait.
+            await transport.send("GET", URL, budget=budget)
+            assert transport.rate_limit_wait_count == 0
+
+            budget.update(RateLimitSnapshot(limit=5000, remaining=0, reset_at=1_030.0))
+            await transport.send("GET", URL, budget=budget)
+            assert transport.rate_limit_wait_count == 1
+            assert calls == [30.0]
+        await transport.aclose()

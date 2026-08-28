@@ -90,3 +90,29 @@ class TestConcurrencyLimiter:
 
         await asyncio.gather(worker(1), worker(2), worker(3))
         assert sorted(order) == [1, 2, 3]
+
+
+class TestBudgetTrackerConsumption:
+    def test_no_consumption_recorded_from_a_single_observation(self):
+        tracker = BudgetTracker("graphql")
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=4990, reset_at=1.0))
+        assert tracker.total_consumed == 0
+
+    def test_accumulates_consumption_across_decreasing_observations_ac_1_3(self):
+        tracker = BudgetTracker("graphql")
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=4990, reset_at=1.0))
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=4980, reset_at=1.0))
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=4975, reset_at=1.0))
+        assert tracker.total_consumed == 15
+
+    def test_a_reset_upward_jump_is_not_counted_as_negative_consumption(self):
+        tracker = BudgetTracker("graphql")
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=10, reset_at=1.0))
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=5000, reset_at=2.0))
+        assert tracker.total_consumed == 0
+
+    def test_a_change_in_limit_is_not_counted(self):
+        tracker = BudgetTracker("graphql")
+        tracker.update(RateLimitSnapshot(limit=5000, remaining=4990, reset_at=1.0))
+        tracker.update(RateLimitSnapshot(limit=15000, remaining=14000, reset_at=2.0))
+        assert tracker.total_consumed == 0

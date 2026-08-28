@@ -39,13 +39,32 @@ class BudgetTracker:
     def __init__(self, name: str) -> None:
         self.name = name
         self._snapshot: RateLimitSnapshot | None = None
+        self._total_consumed = 0
 
     def update(self, snapshot: RateLimitSnapshot) -> None:
+        if (
+            self._snapshot is not None
+            and snapshot.limit == self._snapshot.limit
+            and snapshot.remaining <= self._snapshot.remaining
+        ):
+            self._total_consumed += self._snapshot.remaining - snapshot.remaining
         self._snapshot = snapshot
 
     @property
     def snapshot(self) -> RateLimitSnapshot | None:
         return self._snapshot
+
+    @property
+    def total_consumed(self) -> int:
+        """Cumulative points/requests actually consumed against this budget
+        (AC-1.3, Story 10), derived from successive `remaining` figures
+        GitHub itself reported. A jump upward in `remaining` — a window
+        reset, including the optimistic reset `wait_if_exhausted` applies
+        right after a wait — is not counted as negative consumption; it
+        simply isn't counted, since the true cost of whatever ran right
+        after a reset is only knowable from the next real response, like
+        every other observation here."""
+        return self._total_consumed
 
     async def wait_if_exhausted(
         self,
