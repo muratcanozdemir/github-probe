@@ -23,6 +23,17 @@ from org_harvest.harvest.org_level import OrgLevelResult, fetch_organization_dir
 from org_harvest.harvest.repo_level import RepoLevelResult, fetch_repository_datasets
 from org_harvest.harvest.systemic import SystemicFailureGuard
 from org_harvest.hosts import ApiHost
+from org_harvest.manifest import (
+    CompletionStatus,
+    ConsumptionStats,
+    Manifest,
+    RootIndex,
+    build_manifest,
+    is_snapshot_complete,
+    read_manifest,
+    rebuild_root_index,
+    write_manifest,
+)
 from org_harvest.preflight import DatasetVerdict, PreflightReport, Verdict, run_preflight
 from org_harvest.ratelimit import BudgetTracker, ConcurrencyLimiter, RateLimitSnapshot
 from org_harvest.transport import Transport
@@ -33,7 +44,9 @@ __all__ = [
     "BudgetTracker",
     "CheckpointState",
     "CheckpointStore",
+    "CompletionStatus",
     "ConcurrencyLimiter",
+    "ConsumptionStats",
     "CredentialProvider",
     "DatasetLevel",
     "DatasetOutcome",
@@ -43,22 +56,29 @@ __all__ = [
     "ErrorKind",
     "FinalizeResult",
     "Gap",
+    "Manifest",
     "OrgHarvestError",
     "OrgLevelResult",
     "PreflightReport",
     "RateLimitSnapshot",
     "RepoLevelResult",
+    "RootIndex",
     "SystemicFailureGuard",
     "StaticTokenCredentialProvider",
     "Transport",
     "Verdict",
     "all_dataset_specs",
     "build_credential_provider",
+    "build_manifest",
     "default_dataset_names",
     "fetch_organization_directory",
+    "fetch_repository_datasets",
     "finalize_dataset",
     "finalize_snapshot",
-    "fetch_repository_datasets",
     "get_dataset_spec",
+    "is_snapshot_complete",
+    "read_manifest",
+    "rebuild_root_index",
     "run_preflight",
+    "write_manifest",
 ]

@@ -14,7 +14,7 @@
 | 6 | Repository datasets | implemented | 2026-08-28 | 2026-08-28 |
 | 7 | Failure resilience | implemented | 2026-08-28 | 2026-08-28 |
 | 8 | Parquet finalization | implemented | 2026-08-28 | 2026-08-28 |
-| 9 | Snapshot manifest | not-started | - | - |
+| 9 | Snapshot manifest | implemented | 2026-08-28 | 2026-08-28 |
 | 10 | Full snapshot run | not-started | - | - |
 | 11 | Dataset selection | not-started | - | - |
 | 12 | Automatic resume | not-started | - | - |
