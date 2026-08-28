@@ -1,0 +1,47 @@
+name: CI
+
+# Runs the full quality gate on every push to the default branch and every
+# pull request (AC-10.5) — lint, strict type checking, and the test suite,
+# each as its own step so a failure names exactly what broke. Any non-zero
+# exit fails the job (AC-10.6): no step swallows its own failure.
+#
+# Also exposed as a reusable workflow (`workflow_call`) so release.yml runs
+# this exact same gate before building anything, rather than maintaining a
+# second copy of these steps.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  quality:
+    name: Lint, typecheck, and test
+    runs-on: ubuntu-latest
+    steps:
+      # Every third-party action below is pinned to a full commit SHA, with
+      # the version it corresponds to recorded in a trailing comment
+      # (AC-10.7) — a tag can move, a commit SHA cannot.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy --strict)
+        run: uv run mypy src/
+
+      - name: Test (pytest)
+        run: uv run pytest -q

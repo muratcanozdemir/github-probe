@@ -22,4 +22,4 @@
 | 14 | Retry gaps | implemented | 2026-08-28 | 2026-08-28 |
 | 15 | Library API | implemented | 2026-08-28 | 2026-08-28 |
 | 16 | Operator documentation | implemented | 2026-08-28 | 2026-08-28 |
-| 17 | CI and release | not-started | - | - |
+| 17 | CI and release | implemented | 2026-08-28 | 2026-08-28 |
