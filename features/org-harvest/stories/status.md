@@ -21,5 +21,5 @@
 | 13 | Resume safety guards | implemented | 2026-08-28 | 2026-08-28 |
 | 14 | Retry gaps | implemented | 2026-08-28 | 2026-08-28 |
 | 15 | Library API | implemented | 2026-08-28 | 2026-08-28 |
-| 16 | Operator documentation | not-started | - | - |
+| 16 | Operator documentation | implemented | 2026-08-28 | 2026-08-28 |
 | 17 | CI and release | not-started | - | - |
